@@ -34,6 +34,7 @@ from pis.stats import paired_diff
 ARMS = ("base_r6", "base_r3", "loop_a", "loop_b", "random_selection", "oracle_selection",
         "loop_no_uncertainty", "loop_no_fallback", "adaptive_c9")
 REFERENCE = "base_r6"
+GATE_REASONS = ("untrusted", "no_finite")
 MODEL_ARMS = ("loop_a", "loop_b", "loop_no_uncertainty", "loop_no_fallback")
 LOOP_OPTIONS = {"loop_a": {}, "random_selection": {"selection": "random"},
                 "oracle_selection": {"selection": "oracle"}, "loop_no_uncertainty": {"use_uncertainty": False},
@@ -44,6 +45,7 @@ METRICS = (("value_per_s", "value /s", 1), ("slo_v2_pct", "SLO v2 %", 2), ("slo_
            ("policy_changes", "policy changes", 1))
 RUN_METRICS = (("decide_ms_mean", "decide mean ms", 1), ("decide_ms_p95", "decide p95 ms", 1),
                ("decide_ms_max", "decide max ms", 1), ("fallback_rate", "fallback rate", 3),
+               ("gate_fallback_rate", "gate fallback rate", 3),
                ("gru_error", "GRU error", 3), ("rank_agreement", "rank agreement", 3),
                ("top1_agreement", "top-1 agreement", 3))
 
@@ -156,6 +158,13 @@ def probe_metrics(records: list[dict]) -> dict:
             "top1_agreement": float(np.mean(top)) if top else math.nan}
 
 
+def gate_fallback_rate(records: list[dict]) -> float:
+    """Share of loop decisions that fell back because the gate rejected every candidate (untrusted or no finite
+    score); unlike `fallback_rate` it leaves out the short-history windows at the start. nan for other arms."""
+    reasons = [r["info"]["reason"] for r in records if "reason" in r["info"]]
+    return float(np.mean([x in GATE_REASONS for x in reasons])) if reasons else math.nan
+
+
 # ------------------------------------------------------------------ controllers
 class AdaptiveArm:
     """The sibling's non-ML feedback controller behind the harness's controller protocol."""
@@ -218,7 +227,8 @@ def run_arm(arm: str, seed: int, arms: dict[str, dict], duration_s: float = 60.0
         spec = make_spec(seed)
         ctl = make_controller(arms[arm], spec, probe_every)
         recs = run_scenario(seed, ctl, duration_s)
-        metrics = {**scenario_metrics(recs, spec), **probe_metrics(recs)}
+        metrics = {**scenario_metrics(recs, spec), **probe_metrics(recs),
+                   "gate_fallback_rate": gate_fallback_rate(recs)}
         revised = [r for r in recs if r["info"].get("revised")]
         if arms[arm]["kind"] == "reviser":
             metrics["revisions"] = len(revised)
@@ -246,13 +256,18 @@ def paired(per: dict, a: str, b: str, key: str, conf: float = 0.95) -> dict:
     return {**d, "seeds": seeds}
 
 
+def timing_available(timing: dict | None) -> bool:
+    return timing is not None and "unavailable" not in timing
+
+
 def success(per: dict, arm: str, rule: dict, timing: dict | None) -> dict:
-    """The protocol's success rule for one candidate arm against the reference."""
+    """The protocol's success rule for one candidate arm against the reference. `timing` is the normal-priority
+    verdict, or None / {"unavailable": reason} when it cannot be used (part (c) is then not met)."""
     v = paired(per, arm, rule["reference"], "value_per_s", rule["confidence"])
     s = paired(per, arm, rule["reference"], "slo_v2_pct", rule["confidence"])
     value_ok = bool(v["n"] >= 2 and v["mean"] > 0 and v["lo"] > 0)
     slo_ok = bool(s["n"] >= 2 and s["hi"] <= rule["slo_v2_margin_pp"])
-    time_ok = None if timing is None else bool(timing["p95_ok"] and timing["max_ok"])
+    time_ok = bool(timing["p95_ok"] and timing["max_ok"]) if timing_available(timing) else None
     return {"value": v, "slo_v2": s, "value_ok": value_ok, "slo_ok": slo_ok, "time_ok": time_ok,
             "met": bool(value_ok and slo_ok and time_ok is True)}
 
@@ -327,12 +342,25 @@ def report(raw: list[dict], protocol: dict | None = None, meta: dict | None = No
         t = timing.get(arm)
         sv = success(per, arm, rule, t)
         verdicts[arm] = sv
-        tt = ("not available" if t is None else
-              f"{'within' if sv['time_ok'] else '**over**'} (worst p95 {t['worst_p95']:.1f} ms, max "
-              f"{t['worst_max']:.1f} ms; {t['source']})")
+        if t is None:
+            tt = "not available"
+        elif "unavailable" in t:
+            tt = f"not available: {t['unavailable']}"
+        else:
+            tt = (f"{'within' if sv['time_ok'] else '**over**'} (worst p95 {t['worst_p95']:.1f} ms, max "
+                  f"{t['worst_max']:.1f} ms; {t['source']})")
         L.append(f"| {arm} | {_ci(sv['value'])} {'met' if sv['value_ok'] else 'not met'} | "
                  f"{_ci(sv['slo_v2'], 2)} {'met' if sv['slo_ok'] else 'not met'} | {tt} | {sv['value']['n']} | "
                  f"**{'yes' if sv['met'] else 'no'}** |")
+    short = []
+    for arm, sv in verdicts.items():
+        if sv["value"]["n"] < len(seeds):
+            counts = {a: sum(1 for s in seeds if s not in per.get(a, {})) for a in (arm, ref)}
+            short.append(f"{arm}: n = {sv['value']['n']} of {len(seeds)} scenarios ("
+                         + ", ".join(f"{a} {c} failed or missing" for a, c in counts.items()) + ")")
+    if short:
+        L += ["", "**Warning: the rule was evaluated on fewer scenarios than the protocol's** - " + "; ".join(short)
+              + ". Failed runs are not replaced; see Runs."]
     any_met = [a for a, v in verdicts.items() if v["met"]]
     L += ["", ("**Success: " + ", ".join(any_met) + " met the rule.**") if any_met else
           "**No candidate arm met the success rule.** The result is reported as it is.",
@@ -349,7 +377,9 @@ def report(raw: list[dict], protocol: dict | None = None, meta: dict | None = No
     L += ["", "GRU error, rank agreement and top-1 agreement come from run-time probes of the arms that rank "
           "candidates with the ensemble (every candidate run in a copy of the real simulator after the decision "
           "was timed); n/a for the other arms. Fallback rate: share of decisions where the loop applied the "
-          "base scheduler's greedy policy because no candidate was trusted (or history was short)."]
+          "base scheduler's greedy policy, including the short-history windows at the start of every run; gate "
+          "fallback rate: only the decisions where the gate rejected every candidate (untrusted or no finite "
+          "score)."]
 
     L += ["", f"### Paired differences vs `{ref}` (arm - {ref})", "",
           "| arm | n | " + " | ".join(lab for _, lab, _ in METRICS) + " |",

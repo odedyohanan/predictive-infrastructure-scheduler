@@ -14,13 +14,21 @@ notes of experiments/time_decisions.py) and the failure handling. `make_protocol
 file; the run reads the file, never the generator.
 
 Guards. Seeds 1000-1099 are never accepted. A run on any seed in 2000-2099 must use exactly the protocol's
-seeds and scenario length, no label, the official outputs, a clean working tree, and the protocol and both
-step configs committed at HEAD; attempts are numbered 1..3, each needs the previous attempt's raw directory,
-and an attempt that already has a report section or a raw directory is refused. Any other run must use
+seeds and scenario length, no label, the official outputs, a clean working tree, configs/final_eval.json with
+exactly one commit that touches only it, the step configs the protocol names, all three committed at HEAD,
+unlabelled step configs (Step B tuned on top of this Step A), and ensemble members whose sha256 prefixes match
+the committed tuning notes (results/step_a/tuning.md, results/step_b/report.md). Attempts are numbered 1..3,
+each needs the previous attempt's raw directory, and an attempt that already has a report section or a raw
+directory is refused. A timing note counts for part (c) of the success rule only if it is unlabelled, records
+the evaluated params, reviser and member sha256 prefixes, and (official run) is committed at HEAD; otherwise
+part (c) is "not available" with the reason. Any other run must use
 development seeds 1100-1199 only, label "rehearsal" or "smoke", and outputs outside results/final and
 results/raw/final; it never overwrites a report or a raw attempt either.
 
-Outputs: one "## Attempt N" section appended to results/final/report.md (tracked); per-scenario records
+Outputs: one "## Attempt N" section in results/final/report.md (tracked), appended as a "(started)" stub with
+the provenance before any run (so a crash leaves it, and the dirty tree forces committing it before the next
+attempt) and replaced by the full section at the end; attempt N > 1 summarises attempt N-1 from its raw
+records. Per-scenario records
 streamed to results/raw/final/attempt<N>/runs.jsonl plus run_config.json (gitignored). Recorded: git HEAD,
 sha256 of the protocol, of the step configs and of every model checkpoint. Failed runs are recorded with
 scrubbed messages and listed in the report, never dropped or replaced.
@@ -45,6 +53,7 @@ from pis.runner import ARMS, LOOP_OPTIONS, arm_definitions, describe_arms, repor
 PROTOCOL = "configs/final_eval.json"
 STEP_CONFIGS = {"step_a": "configs/step_a.json", "step_b": "configs/step_b.json"}
 TIMING_NOTES = {"loop_a": "results/step_a/timing.md", "loop_b": "results/step_b/timing.md"}
+TUNING_NOTES = {"step_a": "results/step_a/tuning.md", "step_b": "results/step_b/report.md"}
 OFFICIAL_REPORT, OFFICIAL_RAW = "results/final/report.md", "results/raw/final"
 FINAL_SEEDS, DEV_SEEDS, USED_SEEDS = range(2000, 2100), range(1100, 1200), range(1000, 1100)
 MAX_ATTEMPTS = 3
@@ -140,6 +149,13 @@ def committed_clean(path: str) -> bool:
     return ok and _git("diff", "--quiet", "HEAD", "--", path)[0] == 0
 
 
+def freeze_state() -> dict:
+    """The commits that touched the protocol file (newest first) and the files of the oldest one."""
+    commits = [c for c in _git("log", "--format=%H", "--", PROTOCOL)[1].splitlines() if c]
+    files = _git("show", "--name-only", "--format=", commits[-1])[1].split() if commits else []
+    return {"commits": commits, "files": files}
+
+
 def parse_seeds(text: str) -> list[int]:
     out: list[int] = []
     for part in text.split(","):
@@ -187,7 +203,8 @@ def protocol_seeds(p: dict) -> list[int]:
 
 def check_run(a: dict, protocol: dict, state: dict) -> list[str]:
     """Errors that refuse the run. `state`: dirty (whole tree), committed {path: bool}, report_text,
-    raw_exists (this attempt), prev_raw_exists (previous attempt), out_exists."""
+    raw_exists (this attempt), prev_raw_exists (previous attempt), out_exists, freeze {commits, files} (the
+    commits touching the protocol and the files of the first one)."""
     errors = []
     seeds = a["seeds_list"]
     if not seeds:
@@ -211,6 +228,16 @@ def check_run(a: dict, protocol: dict, state: dict) -> list[str]:
         for path, ok in state["committed"].items():
             if not ok:
                 errors.append(f"{path} is not committed at HEAD (or differs from it)")
+        expected = {"protocol": PROTOCOL, "step_a_config": protocol["arms"]["loop_a"].get("config"),
+                    "step_b_config": protocol["arms"]["loop_b"].get("config")}
+        for key, want in expected.items():
+            got = a.get(key, want)
+            if not want or Path(got).resolve() != Path(want).resolve():
+                errors.append(f"a run on the held-out seeds reads {want} (--{key.replace('_', '-')})")
+        freeze = state.get("freeze", {"commits": [], "files": []})
+        if len(freeze["commits"]) != 1 or freeze["files"] != [PROTOCOL]:
+            errors.append(f"{PROTOCOL} must have exactly one commit, touching only that file (found "
+                          f"{len(freeze['commits'])} commit(s), files {freeze['files']})")
         if not _inside(a["out"], OFFICIAL_REPORT) or not _inside(a["raw_dir"], OFFICIAL_RAW):
             errors.append(f"a run on the held-out seeds writes {OFFICIAL_REPORT} and {OFFICIAL_RAW}")
         if not 1 <= a["attempt"] <= MAX_ATTEMPTS:
@@ -248,7 +275,107 @@ def read_timing(path: str) -> dict | None:
     label = re.search(r"^# .*\((\w+)\)\s*$", text, flags=re.M)
     return {"worst_p95": float(m95.group(1)), "worst_max": float(mmax.group(1)),
             "p95_ok": m95.group(2) == "within", "max_ok": mmax.group(2) == "within",
-            "source": path + (f" ({label.group(1)})" if label else "")}
+            "label": label.group(1) if label else "", "source": path + (f" ({label.group(1)})" if label else "")}
+
+
+_MEMBER = re.compile(r"([^\s,;]+) \(sha256 ([0-9a-f]{16})\)")
+
+
+def recorded_members(text: str) -> list[tuple[str, str]] | None:
+    """(path, sha256[:16]) of each member on a note's "- members:" line (tuning, Step B and timing notes)."""
+    m = re.search(r"^- members: (.*)$", text, flags=re.M)
+    return _MEMBER.findall(m.group(1)) if m else None
+
+
+def member_mismatch(text: str, members: list[str], shas: dict[str, str], exact: bool) -> str | None:
+    """Why the note's recorded members do not match `members` (sha256 by member), or None when they do.
+    `exact`: the same members in the same order; otherwise every member must be among the recorded ones."""
+    rec = recorded_members(text)
+    if not rec:
+        return "no member sha256 recorded"
+    if exact and [p for p, _ in rec] != [safe_path(m) for m in members]:
+        return "recorded members differ from the config's"
+    got = dict(rec)
+    for m in members:
+        k = safe_path(m)
+        if k not in got:
+            return f"member {k} not recorded"
+        if got[k] != shas[m][:16]:
+            return f"member {k} sha256 {shas[m][:16]} differs from the recorded {got[k]}"
+    return None
+
+
+def recorded_params(text: str) -> tuple[dict | None, dict | None]:
+    """(controller params, reviser) recorded on a timing note's "- controller params:" line."""
+    m = re.search(r"^- controller params: (.*)$", text, flags=re.M)
+    if not m:
+        return None, None
+    params, _, reviser = m.group(1).partition("; reviser ")
+    try:
+        return json.loads(params), (json.loads(reviser) if reviser else None)
+    except ValueError:
+        return None, None
+
+
+def _same_params(a: dict | None, b: dict) -> bool:
+    from pis.evaluator import Params
+    try:
+        return a is not None and Params.from_dict(a).to_dict() == Params.from_dict(b).to_dict()
+    except (TypeError, ValueError, KeyError):
+        return False
+
+
+def timing_for(path: str, kind: str, cfg: dict, shas: dict[str, str], official: bool, committed: bool) -> dict:
+    """The timing verdict for part (c) of the success rule, or {"unavailable": reason}: the note must exist and
+    be unlabelled, record the config's params (and reviser) and member sha256 prefixes, and in an official run
+    be committed at HEAD."""
+    t = read_timing(path)
+    if t is None:
+        return {"unavailable": f"{path} missing or without a verdict"}
+    text = Path(path).read_text()
+    reasons = []
+    if official and not committed:
+        reasons.append("not committed at HEAD")
+    if t["label"]:
+        reasons.append(f"labelled {t['label']!r}")
+    if not re.search(rf"^# Decision time, Step {kind.upper()}\b", text, flags=re.M):
+        reasons.append(f"not a Step {kind.upper()} timing note")
+    params, reviser = recorded_params(text)
+    if not _same_params(params, cfg["params"] if kind == "a" else cfg["step_a_params"]):
+        reasons.append("params differ from the step config")
+    if kind == "b" and reviser != cfg["reviser"]:
+        reasons.append("reviser differs from the step config")
+    mm = member_mismatch(text, list(cfg["members"]), shas, exact=True)
+    if mm:
+        reasons.append(mm)
+    return {"unavailable": f"{path}: " + "; ".join(reasons)} if reasons else t
+
+
+def summarise_attempt(raw_attempt: Path) -> str:
+    """One line on an earlier attempt from its raw directory: records, ok / failed, completed or not."""
+    recs = []
+    runs = raw_attempt / "runs.jsonl"
+    if runs.is_file():
+        recs = [json.loads(x) for x in runs.read_text().splitlines() if x.strip()]
+    cfg = {}
+    try:
+        cfg = json.loads((raw_attempt / "run_config.json").read_text())
+    except (OSError, ValueError):
+        pass
+    expected = cfg.get("n_seeds", 0) * len(cfg.get("arms", {})) or "?"
+    failed = sum(bool(r.get("failed")) for r in recs)
+    return (f"{len(recs)} of {expected} runs recorded ({len(recs) - failed} ok, {failed} failed), "
+            f"{'completed' if 'end_utc' in cfg else 'did not complete'}")
+
+
+def replace_section(text: str, attempt: int, new: str) -> str:
+    """`text` with the section of `attempt` (from its "## Attempt N" heading to the next attempt) replaced."""
+    m = re.search(rf"^## Attempt {attempt}\b.*$", text, flags=re.M)
+    if not m:
+        return text + new
+    nxt = re.search(r"^## Attempt \d+\b", text[m.end():], flags=re.M)
+    end = m.end() + nxt.start() if nxt else len(text)
+    return text[:m.start()] + new + text[end:]
 
 
 # ------------------------------------------------------------------ worker side
@@ -304,12 +431,14 @@ def main(argv=None):
     raw_attempt = Path(a.raw_dir) / f"attempt{a.attempt}"
     out = Path(a.out)
     args = {"seeds_list": seeds, "label": a.label, "duration": duration, "out": a.out, "raw_dir": a.raw_dir,
-            "attempt": a.attempt, "priority": a.priority}
+            "attempt": a.attempt, "priority": a.priority, "protocol": a.protocol,
+            "step_a_config": a.step_a_config, "step_b_config": a.step_b_config}
     state = {"dirty": bool(_git("status", "--porcelain")[1]),
              "committed": {p: committed_clean(p) for p in (a.protocol, a.step_a_config, a.step_b_config)},
              "report_text": out.read_text() if out.exists() else "", "out_exists": out.exists(),
              "raw_exists": raw_attempt.exists(),
-             "prev_raw_exists": (Path(a.raw_dir) / f"attempt{a.attempt - 1}").is_dir()}
+             "prev_raw_exists": (Path(a.raw_dir) / f"attempt{a.attempt - 1}").is_dir(),
+             "freeze": freeze_state()}
     errors = check_run(args, protocol, state)
     if errors:
         raise SystemExit("refusing to run: " + "; ".join(errors))
@@ -346,7 +475,20 @@ def main(argv=None):
     missing = [m for m in members if not resolve(m).is_file()]
     if missing:
         raise SystemExit("missing ensemble members: " + ", ".join(safe_path(m) for m in missing))
-    models = {f"member {safe_path(m)}": _sha256(resolve(m)) for m in members}
+    shas = {m: _sha256(resolve(m)) for m in members}
+    models = {f"member {safe_path(m)}": shas[m] for m in members}
+    if official:
+        problems = []
+        for key, exact in (("step_a", False), ("step_b", True)):
+            note = TUNING_NOTES[key]
+            if not committed_clean(note):
+                problems.append(f"{note} is not committed at HEAD")
+                continue
+            mm = member_mismatch(Path(note).read_text(), list(steps[key]["members"]), shas, exact)
+            if mm:
+                problems.append(f"{note}: {mm}")
+        if problems:
+            raise SystemExit("refusing to run: " + "; ".join(problems))
     for name in ("base_r6", "base_r3"):
         d = protocol["arms"][name]
         sha = _sha256(sibling_paths()["sched"] / d["checkpoint"])
@@ -360,7 +502,9 @@ def main(argv=None):
     import torch
     config = {"attempt": a.attempt, "label": a.label, "official": official,
               "code": f"git HEAD {head}{' (uncommitted changes)' if state['dirty'] else ''}",
-              "protocol": {"path": safe_path(a.protocol), "sha256": _sha256(Path(a.protocol))},
+              "protocol": {"path": safe_path(a.protocol), "sha256": _sha256(Path(a.protocol)),
+                           "freeze_commit": (state["freeze"]["commits"][-1] if state["freeze"]["commits"] and
+                                             Path(a.protocol).resolve() == Path(PROTOCOL).resolve() else None)},
               "step_configs": {k: {"path": safe_path(p), "sha256": _sha256(Path(p)), "code": steps[k].get("code"),
                                    "selected_on_seeds": steps[k].get("selected_on_seeds"),
                                    "label": steps[k].get("label")}
@@ -372,8 +516,35 @@ def main(argv=None):
               "versions": {"python": platform.python_version(), "numpy": numpy.__version__,
                            "torch": torch.__version__},
               "start_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())}
+    title = f"Attempt {a.attempt}{' (' + a.label + ')' if a.label else ''}"
+    freeze = config["protocol"]["freeze_commit"]
+    meta = {"title": title, "code": config["code"],
+            "protocol": f"{config['protocol']['path']} (sha256 {config['protocol']['sha256'][:16]}"
+                        + (f", frozen in commit {freeze}" if freeze else "") + ")",
+            "step configs": "; ".join(f"{k} {v['path']} (sha256 {v['sha256'][:16]}, selected on seeds "
+                                      f"{v['selected_on_seeds']}, label {v['label']!r})"
+                                      for k, v in config["step_configs"].items()),
+            "models": ", ".join(f"{k} ({v[:16]})" for k, v in models.items()),
+            "arms": "; ".join(f"{k}: {v}" for k, v in config["arms"].items()),
+            "seeds": f"{config['seeds']} ({len(seeds)} scenarios, {duration:g} s each)",
+            "run-time probe": f"every {probe_every}th model decision",
+            "raw": safe_path(str(raw_attempt)) if not official else f"{OFFICIAL_RAW}/attempt{a.attempt}/"}
+    prev = Path(a.raw_dir) / f"attempt{a.attempt - 1}"
+    if a.attempt > 1 and prev.is_dir():
+        meta["previous attempt"] = f"attempt {a.attempt - 1}: {summarise_attempt(prev)}"
     raw_attempt.mkdir(parents=True, exist_ok=False)          # never overwrite an earlier attempt
     (raw_attempt / "run_config.json").write_text(scrub(json.dumps(config, indent=1)) + "\n")
+    # the attempt's section exists from the start: a crash leaves it in the report (and the tree dirty)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    head_text = "" if state["report_text"] else (
+        "# Final paired evaluation\n\nProtocol: configs/final_eval.json, frozen in its own commit before the run. "
+        "One section per attempt, written when the attempt starts and completed when it finishes; never edited "
+        "afterwards.\n\n")
+    stub = (f"## {title} (started)\n\n" + "".join(f"- {k}: {v}\n" for k, v in meta.items() if k != "title")
+            + f"- started (UTC): {config['start_utc']}\n\nThis attempt has not finished: it is running, or it "
+            "stopped; its finished runs are in the raw records.\n\n")
+    with out.open("a") as f:
+        f.write(scrub(head_text + stub))
     order = {arm: i for i, arm in enumerate(SLOW_FIRST)}
     jobs = sorted(((arm, s) for arm in arms for s in seeds), key=lambda j: (order[j[0]], j[1]))
     print(f"attempt {a.attempt}{' (' + a.label + ')' if a.label else ''}: {len(jobs)} runs "
@@ -406,29 +577,15 @@ def main(argv=None):
                   runs_ok=sum(not r["failed"] for r in raw), runs_failed=sum(r["failed"] for r in raw))
     (raw_attempt / "run_config.json").write_text(scrub(json.dumps(config, indent=1)) + "\n")
 
-    timing = {arm: read_timing(p) for arm, p in TIMING_NOTES.items()}
+    timing = {arm: timing_for(path, kind, steps[key], shas, official, committed_clean(path))
+              for arm, path, kind, key in (("loop_a", TIMING_NOTES["loop_a"], "a", "step_a"),
+                                           ("loop_b", TIMING_NOTES["loop_b"], "b", "step_b"))}
     per_arm_s = {arm: [r["seconds"] for r in raw if r["arm"] == arm] for arm in arms}
-    meta = {"title": f"Attempt {a.attempt}{' (' + a.label + ')' if a.label else ''}",
-            "code": config["code"],
-            "protocol": f"{config['protocol']['path']} (sha256 {config['protocol']['sha256'][:16]})",
-            "step configs": "; ".join(f"{k} {v['path']} (sha256 {v['sha256'][:16]}, selected on seeds "
-                                      f"{v['selected_on_seeds']}, label {v['label']!r})"
-                                      for k, v in config["step_configs"].items()),
-            "models": ", ".join(f"{k} ({v[:16]})" for k, v in models.items()),
-            "arms": "; ".join(f"{k}: {v}" for k, v in config["arms"].items()),
-            "seeds": f"{config['seeds']} ({len(seeds)} scenarios, {duration:g} s each)",
-            "run-time probe": f"every {probe_every}th model decision",
-            "runtime": f"{runtime:.0f} s with {a.procs} processes ({a.priority} priority); seconds per run by "
-                       "arm (mean): "
-                       + ", ".join(f"{k} {sum(v) / len(v):.1f}" for k, v in per_arm_s.items() if v),
-            "raw": safe_path(str(raw_attempt)) if not official else f"{OFFICIAL_RAW}/attempt{a.attempt}/"}
+    meta["runtime"] = (f"{runtime:.0f} s with {a.procs} processes ({a.priority} priority), started "
+                       f"{config['start_utc']} UTC; seconds per run by arm (mean): "
+                       + ", ".join(f"{k} {sum(v) / len(v):.1f}" for k, v in per_arm_s.items() if v))
     text = report(raw, protocol, meta, timing, seeds, background=a.priority == "background")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    head_text = "" if state["report_text"] else (
-        "# Final paired evaluation\n\nProtocol: configs/final_eval.json, frozen in its own commit before the run. "
-        "One section per attempt; never edited.\n\n")
-    with out.open("a") as f:
-        f.write(scrub(head_text + text + "\n"))
+    out.write_text(replace_section(out.read_text(), a.attempt, scrub(text + "\n")))
     print(f"done: {config['runs_ok']} ok, {config['runs_failed']} failed, {runtime:.0f} s -> {safe_path(a.out)}")
     return {"raw": raw, "text": text, "config": config}
 

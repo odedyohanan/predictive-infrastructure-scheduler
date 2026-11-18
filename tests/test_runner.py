@@ -134,7 +134,8 @@ def test_committed_protocol_is_the_generated_one():
 
 def _state(**kw):
     s = {"dirty": False, "committed": {fe.PROTOCOL: True, "configs/step_a.json": True, "configs/step_b.json": True},
-         "report_text": "", "out_exists": False, "raw_exists": False, "prev_raw_exists": False}
+         "report_text": "", "out_exists": False, "raw_exists": False, "prev_raw_exists": False,
+         "freeze": {"commits": ["c" * 40], "files": [fe.PROTOCOL]}}
     s.update(kw)
     return s
 
@@ -169,6 +170,28 @@ def test_official_guards():
     assert _check(_args(attempt=4), _state(prev_raw_exists=True))
 
 
+def test_official_reads_the_frozen_protocol_and_its_configs():
+    assert _check(_args(protocol=fe.PROTOCOL, step_a_config="configs/step_a.json",
+                        step_b_config="configs/step_b.json")) == []
+    assert any("--protocol" in e for e in _check(_args(protocol="other/final_eval.json")))
+    assert any("--step-a-config" in e for e in _check(_args(step_a_config="other/step_a.json")))
+    assert any("--step-b-config" in e for e in _check(_args(step_b_config="configs/step_a.json")))
+    for freeze in ({"commits": [], "files": []}, {"commits": ["a" * 40, "b" * 40], "files": [fe.PROTOCOL]},
+                   {"commits": ["a" * 40], "files": [fe.PROTOCOL, "pis/runner.py"]}):
+        assert any("exactly one commit" in e for e in _check(_args(), _state(freeze=freeze)))
+    # rehearsals may use scratch protocols and configs
+    ok = _args(seeds_list=[1150], label="rehearsal", duration=10.0, out="s/r.md", raw_dir="s/raw",
+               protocol="s/p.json", step_a_config="s/a.json")
+    assert _check(ok, _state(freeze={"commits": [], "files": []})) == []
+
+
+def test_freeze_state_of_this_repo():
+    st = fe.freeze_state()
+    if not st["commits"]:
+        pytest.skip("protocol not frozen yet")
+    assert len(st["commits"]) == 1 and st["files"] == [fe.PROTOCOL]
+
+
 def test_used_seeds_never_accepted():
     for seeds in ([1000], [1099], list(range(1050, 1060))):
         for label in ("", "rehearsal", "smoke"):
@@ -197,6 +220,84 @@ def test_read_timing(tmp_path):
     assert fe.read_timing(str(tmp_path / "missing.md")) is None
 
 
+SHA = {GATE: "a" * 64, "models/ens_1.pt": "b" * 64}
+
+
+def _timing_note(kind="A", label="", params=PARAMS, reviser=None, members=((GATE, "a" * 16),), p95="within"):
+    rev = f"; reviser {json.dumps(reviser)}" if reviser else ""
+    return (f"# Decision time, Step {kind} at normal priority{' (' + label + ')' if label else ''}\n\n"
+            "- code: git HEAD abc\n- config: configs/step_x.json\n- members: "
+            + ", ".join(f"{m} (sha256 {h})" for m, h in members) + "\n"
+            f"- controller params: {json.dumps(params)}{rev}\n\n"
+            f"- worst per-scenario p95 12.5 ms: {p95} the 50 ms limit\n- worst max 99.0 ms: within the 500 ms limit\n")
+
+
+def test_timing_counts_only_for_the_evaluated_config(tmp_path):
+    a_cfg = {"members": [GATE], "params": PARAMS}
+    b_cfg = {"members": [GATE], "step_a_params": PARAMS, "reviser": REVISER}
+    note = tmp_path / "t.md"
+
+    def tf(text, kind="a", cfg=a_cfg, official=True, committed=True):
+        note.write_text(text)
+        return fe.timing_for(str(note), kind, cfg, SHA, official, committed)
+    t = tf(_timing_note())
+    assert "unavailable" not in t and t["p95_ok"] and t["max_ok"]
+    assert "unavailable" not in tf(_timing_note("B", reviser=REVISER), "b", b_cfg)
+    assert "not committed" in tf(_timing_note(), committed=False)["unavailable"]
+    assert "unavailable" not in tf(_timing_note(), official=False, committed=False)
+    assert "labelled 'smoke'" in tf(_timing_note(label="smoke"))["unavailable"]
+    assert "params differ" in tf(_timing_note(params={**PARAMS, "horizon_h": 3}))["unavailable"]
+    assert "Step A timing note" in tf(_timing_note("B", reviser=REVISER))["unavailable"]
+    assert "reviser differs" in tf(_timing_note("B", reviser={**REVISER, "rev_steps": 2}), "b", b_cfg)["unavailable"]
+    assert "differs from the recorded" in tf(_timing_note(members=((GATE, "f" * 16),)))["unavailable"]
+    assert "missing" in fe.timing_for(str(tmp_path / "none.md"), "a", a_cfg, SHA, True, True)["unavailable"]
+    # the report shows the reason and does not count part (c)
+    raw = [_ok("base_r6", s, 100.0) for s in range(3)] + [_ok("loop_a", s, 110.0 + s) for s in range(3)]
+    text = runner.report(raw, fe.make_protocol(), timing={"loop_a": {"unavailable": "x.md: labelled 'smoke'"}},
+                         seeds=[0, 1, 2])
+    assert "not available: x.md: labelled 'smoke'" in text
+
+
+def test_member_prefixes_against_tuning_notes():
+    tuning = "# Step A tuning\n\n- code: git HEAD x\n- members: " + ", ".join(
+        f"{m} (sha256 {h[:16]})" for m, h in SHA.items()) + "\n- calibration seeds: 1100-1109\n"
+    assert fe.recorded_members(tuning) == [(GATE, "a" * 16), ("models/ens_1.pt", "b" * 16)]
+    assert fe.member_mismatch(tuning, [GATE], SHA, exact=False) is None          # Step A config: first N
+    assert fe.member_mismatch(tuning, [GATE], SHA, exact=True)
+    assert "differs" in fe.member_mismatch(tuning, [GATE], {GATE: "c" * 64}, exact=False)
+    assert "not recorded" in fe.member_mismatch(tuning, ["models/ens_9.pt"], {"models/ens_9.pt": "d" * 64}, False)
+    assert fe.member_mismatch("# no members\n", [GATE], SHA, exact=False) == "no member sha256 recorded"
+
+
+def test_replace_section_and_attempt_summary(tmp_path):
+    text = "# T\n\n## Attempt 1\n\nold one\n\n## Attempt 2 (started)\n\nstub\n\n## Attempt 3\n\nthree\n"
+    out = fe.replace_section(text, 2, "## Attempt 2\n\nfull\n\n")
+    assert "stub" not in out and "old one" in out and "three" in out and "full" in out
+    assert fe.replace_section("# T\n\n", 1, "## Attempt 1\n") == "# T\n\n## Attempt 1\n"
+    d = tmp_path / "attempt1"
+    d.mkdir()
+    (d / "run_config.json").write_text(json.dumps({"n_seeds": 2, "arms": {"x": 1, "y": 1}}))
+    (d / "runs.jsonl").write_text(json.dumps({"failed": False}) + "\n" + json.dumps({"failed": True}) + "\n")
+    assert fe.summarise_attempt(d) == "2 of 4 runs recorded (1 ok, 1 failed), did not complete"
+
+
+def test_short_n_warning():
+    raw = [_ok("base_r6", s, 100.0) for s in range(4)] + [_ok("loop_a", s, 101.0) for s in range(3)]
+    raw.append({"seed": 3, "arm": "loop_a", "failed": True, "error": "E: x", "seconds": 0.0})
+    text = runner.report(raw, fe.make_protocol(), seeds=[0, 1, 2, 3])
+    assert "fewer scenarios than the protocol's" in text and "loop_a: n = 3 of 4" in text
+    assert "loop_a 1 failed or missing" in text and "base_r6 0 failed or missing" in text
+    full = runner.report([r for r in raw if r["seed"] < 3], fe.make_protocol(), seeds=[0, 1, 2])
+    assert "loop_a: n =" not in full and "loop_b: n = 0 of 3" in full      # loop_b has no runs at all
+
+
+def test_gate_fallback_rate():
+    recs = [{"info": {"reason": r}} for r in ("short_history", "short_history", "model", "untrusted", "no_finite",
+                                              "revised", "model", "model")]
+    assert runner.gate_fallback_rate(recs) == pytest.approx(2 / 8)
+    assert math.isnan(runner.gate_fallback_rate([{"info": {"decide_ms": 1.0}}]))
+
+
 # ------------------------------------------------------------------ end to end on development seeds
 @pytest.fixture(scope="module")
 def dry_run(tmp_path_factory):
@@ -222,6 +323,8 @@ def test_dry_run_on_dev_seeds_produces_all_arms(dry_run):
     lines = (d / "raw" / "attempt1" / "runs.jsonl").read_text().splitlines()
     assert len(lines) == len(runner.ARMS)
     text = (d / "report.md").read_text()
+    assert "(started)" not in text and text.count("## Attempt 1") == 1
+    assert "gate fallback rate" in text and "not available: " in text      # scratch configs have no timing note
     for s in ("## Attempt 1 (rehearsal)", "### Success rule", "Measured at normal priority",
               "### Paired differences vs `base_r6`", "### Secondary comparisons"):
         assert s in text
@@ -245,3 +348,31 @@ def test_run_config_has_no_absolute_paths_or_hostnames(dry_run):
     assert cfg["protocol"]["path"].startswith("<abs>/") and len(cfg["protocol"]["sha256"]) == 64
     assert all(len(v) == 64 for v in cfg["models_sha256"].values()) and "base_r6 sched:models/rl_r6/final.pt" in \
         cfg["models_sha256"]
+
+
+def test_crashed_attempt_leaves_its_section_and_is_summarised_by_the_next(tmp_path, monkeypatch):
+    proto = tmp_path / "protocol.json"
+    proto.write_text(json.dumps(fe.make_protocol()))
+    (tmp_path / "a.json").write_text(json.dumps({"members": [GATE], "params": PARAMS}))
+    (tmp_path / "b.json").write_text(json.dumps({"members": [GATE], "step_a_params": PARAMS, "reviser": REVISER}))
+    monkeypatch.setattr(fe, "_init_worker", lambda *a: fe._W.update(arms=a[0], duration=a[1], probe_every=a[2]))
+    calls = []
+
+    def fake(arm, seed, arms, duration, probe_every):
+        calls.append(arm)
+        if len(calls) == 3 and "crashed" not in calls:
+            calls.append("crashed")
+            raise RuntimeError("worker died")
+        return _ok(arm, seed, 100.0)
+    monkeypatch.setattr(fe, "run_arm", fake)
+    common = ["--protocol", str(proto), "--step-a-config", str(tmp_path / "a.json"), "--step-b-config",
+              str(tmp_path / "b.json"), "--seeds", "1150", "--label", "rehearsal", "--procs", "1",
+              "--raw-dir", str(tmp_path / "raw")]
+    with pytest.raises(RuntimeError):
+        fe.main(common + ["--out", str(tmp_path / "r1.md")])
+    first = (tmp_path / "r1.md").read_text()
+    assert "## Attempt 1 (rehearsal) (started)" in first and "has not finished" in first
+    fe.main(common + ["--out", str(tmp_path / "r2.md"), "--attempt", "2"])
+    second = (tmp_path / "r2.md").read_text()
+    assert "## Attempt 2 (rehearsal)" in second and "(started)" not in second
+    assert "previous attempt: attempt 1: 2 of 9 runs recorded (2 ok, 0 failed), did not complete" in second
