@@ -50,9 +50,29 @@ DEFAULTS = {"seeds": "1140-1199", "grid_mech": "gradient,neighbourhood", "grid_s
             "grid_steps_neighbourhood": "1,3", "grid_rev_lam": "1,4", "rev_lr": 0.6, "slo_margin": 1.0,
             "duration": 60.0, "max_configs": 8}
 DECIDE_P95_MS, DECIDE_MAX_MS = 50.0, 500.0         # official decision-time limits (normal priority)
-BACKGROUND_FACTOR = 2.0                             # tuning runs at background QoS on efficiency cores
+BACKGROUND_FACTOR = DEFAULTS_BACKGROUND_FACTOR = 2.0  # tuning runs at background QoS on efficiency cores
 GATE_P95_MS, GATE_MAX_MS = BACKGROUND_FACTOR * DECIDE_P95_MS, BACKGROUND_FACTOR * DECIDE_MAX_MS
 EXPLOIT_FLAG = 0.5        # a config whose applied revisions lose in reality more often than this is flagged
+
+
+def set_background_factor(factor: float):
+    """Set the background-QoS decision-time gate to `factor` x the official limits."""
+    global BACKGROUND_FACTOR, GATE_P95_MS, GATE_MAX_MS
+    if not factor >= 1.0:
+        raise SystemExit("--background-factor must be >= 1")
+    BACKGROUND_FACTOR = factor
+    GATE_P95_MS, GATE_MAX_MS = factor * DECIDE_P95_MS, factor * DECIDE_MAX_MS
+
+
+def load_raw_runs(path: str, cfgs: list[dict], seeds: list[int]) -> list[dict]:
+    """The per-run records of an earlier raw file; refuses unless its grid and seeds equal this run's."""
+    d = json.loads(Path(path).read_text())
+    if [r["cfg"] for r in d["rows"]] != cfgs:
+        raise SystemExit("the raw file's grid differs from this run's")
+    runs = d["runs"]
+    if sorted({r["seed"] for r in runs}) != sorted(seeds):
+        raise SystemExit("the raw file's seeds differ from this run's")
+    return runs
 
 
 def _git(*args) -> str:
@@ -390,8 +410,13 @@ def main(argv=None):
     ap.add_argument("--out", default=OFFICIAL_NOTE)
     ap.add_argument("--config-out", default=OFFICIAL_CONFIG)
     ap.add_argument("--raw", default=None)
+    ap.add_argument("--background-factor", type=float, default=DEFAULTS_BACKGROUND_FACTOR,
+                    help="decision-time gate = factor x the official limits (measured background/normal ratio)")
+    ap.add_argument("--from-raw", default=None,
+                    help="re-select from the runs of an earlier raw file instead of simulating (same seeds and grid)")
     a = ap.parse_args(argv)
     args = vars(a)
+    set_background_factor(a.background_factor)
     dirty = bool(_git("status", "--porcelain", "--", "pis", "experiments"))
     config_exists = Path(OFFICIAL_CONFIG).exists() or Path(a.config_out).exists()
     errors = check_run(args, dirty, Path(a.out).exists(), config_exists)
@@ -412,22 +437,25 @@ def main(argv=None):
     cfgs = grid(args)
     seeds = parse_seeds(a.seeds)
     t0 = time.time()
-    pool = None
-    if a.procs > 1:
-        from multiprocessing import get_context
-        pool = get_context("spawn").Pool(a.procs, initializer=_init_worker, initargs=(members, a.duration))
+    if a.from_raw:
+        res = load_raw_runs(a.from_raw, cfgs, seeds)
     else:
-        _init_worker(members, a.duration)
-    try:
-        jobs = ([{"kind": "base", "seed": s} for s in seeds]
-                + [{"kind": "step_a", "seed": s, "params": params} for s in seeds]
-                + [{"kind": "reviser", "seed": s, "cfg_id": i, "cfg": c, "params": params, "rev_lr": a.rev_lr}
-                   for i, c in enumerate(cfgs) for s in seeds])
-        res = _run(pool, jobs, "base + step A + reviser grid", t0)
-    finally:
-        if pool is not None:
-            pool.close()
-            pool.join()
+        pool = None
+        if a.procs > 1:
+            from multiprocessing import get_context
+            pool = get_context("spawn").Pool(a.procs, initializer=_init_worker, initargs=(members, a.duration))
+        else:
+            _init_worker(members, a.duration)
+        try:
+            jobs = ([{"kind": "base", "seed": s} for s in seeds]
+                    + [{"kind": "step_a", "seed": s, "params": params} for s in seeds]
+                    + [{"kind": "reviser", "seed": s, "cfg_id": i, "cfg": c, "params": params, "rev_lr": a.rev_lr}
+                       for i, c in enumerate(cfgs) for s in seeds])
+            res = _run(pool, jobs, "base + step A + reviser grid", t0)
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
     base = {r["seed"]: r["metrics"] for r in res if r["kind"] == "base" and "metrics" in r}
     step_a_arm = {r["seed"]: r["metrics"] for r in res if r["kind"] == "step_a" and "metrics" in r}
     rows, per_cfg = [], {}
@@ -451,7 +479,9 @@ def main(argv=None):
                     f"{a.grid_steps_neighbourhood}; revision lam {a.grid_rev_lam}",
             "fixed": f"gradient learning rate {a.rev_lr}, scenario {a.duration:g} s",
             "slo margin (pp)": a.slo_margin,
-            "runtime": f"{runtime:.0f} s with {a.procs} processes", "_rev_lr": a.rev_lr}
+            "runtime": (f"re-selected from {safe_path(a.from_raw)} (no new simulation)" if a.from_raw
+                        else f"{runtime:.0f} s with {a.procs} processes"),
+            "decision-time gate": f"{BACKGROUND_FACTOR:g}x the official limits", "_rev_lr": a.rev_lr}
     base_summary = {"n": len(base), **{k: float(np.mean([m[v] for m in base.values()])) if base else math.nan
                                        for k, v in (("value", "value_per_s"), ("slo_v2", "slo_v2_pct"),
                                                     ("slo_v1", "slo_v1_pct"))}}

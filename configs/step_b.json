@@ -1,0 +1,32 @@
+{
+ "members": [
+  "worldmodel:models/gru_mix_bounded.pt",
+  "models/ens_1.pt",
+  "models/ens_2.pt",
+  "models/ens_3.pt",
+  "models/ens_4.pt"
+ ],
+ "step_a_params": {
+  "n_candidates_m": 4,
+  "horizon_h": 3,
+  "lam": 1.0,
+  "mu": 8.0,
+  "change_cost": 0.0,
+  "tau": 0.1571656037280141,
+  "slo_lam": 40.0
+ },
+ "reviser": {
+  "mechanism": "gradient",
+  "rev_steps": 4,
+  "rev_lam": 4.0,
+  "rev_lr": 0.6
+ },
+ "beats_base": true,
+ "beats_step_a": false,
+ "exploit_rate": 0.4166666666666667,
+ "exploit_flagged": false,
+ "step_a_config": "configs/step_a.json",
+ "selected_on_seeds": "1140-1199",
+ "code": "74b6b5b66d6f5233195e3f604366c26afd085bdb",
+ "label": ""
+}
