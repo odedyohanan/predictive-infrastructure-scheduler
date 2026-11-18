@@ -80,10 +80,14 @@ def test_select_best_needs_all_seeds():
 
 
 def test_select_best_excludes_non_finite_tau_and_slow_configs():
-    rows = [_row(3, 4, 3, 90.0, 0.0, tau=float("nan")), _row(3, 4, 3, 80.0, 0.0, p95=51.0),
-            _row(3, 4, 3, 70.0, 0.0, mx=501.0), _row(3, 4, 3, 60.0, 0.0, tau="inf"), _row(3, 4, 3, 5.0, 0.0)]
+    rows = [_row(3, 4, 3, 90.0, 0.0, tau=float("nan")), _row(3, 4, 3, 80.0, 0.0, p95=101.0),
+            _row(3, 4, 3, 70.0, 0.0, mx=1001.0), _row(3, 4, 3, 60.0, 0.0, tau="inf"), _row(3, 4, 3, 5.0, 0.0)]
     best, feas, _ = tune.select_best(rows, 1.0, n_seeds=10)
     assert feas == [False, False, False, True, True] and best == 3      # "inf" = deliberate no-gate config
+    # background-QoS gate: 2x the official 50 / 500 ms limits
+    assert (tune.GATE_P95_MS, tune.GATE_MAX_MS) == (100.0, 1000.0)
+    assert (tune.DECIDE_P95_MS, tune.DECIDE_MAX_MS) == (50.0, 500.0)
+    assert tune.select_best([_row(3, 4, 3, 5.0, 0.0, p95=99.0, mx=999.0)], 1.0, n_seeds=10)[1] == [True]
 
 
 def test_select_best_flags_no_gain():
@@ -109,6 +113,7 @@ def test_tiny_end_to_end_run(tmp_path):
     text = out.read_text()
     assert "## Grid" in text and "**chosen**" in text and "## Ablations" in text and "oracle" in text
     assert "_qs" not in text
+    assert "background-QoS limits" in text and "time_decisions.py" in text
     assert str(Path.home()) not in text and str(tmp_path) not in text
     def _no_nan(x):
         raise ValueError(f"non-strict JSON constant {x}")

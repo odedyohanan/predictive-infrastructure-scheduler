@@ -51,6 +51,8 @@ def test_default_grid():
     assert {c["mechanism"] for c in g} == {"gradient", "neighbourhood"}
     assert all(c["rev_lam"] > 0 for c in g)
     assert tune.OFFICIAL_NOTE == "results/step_b/report.md"
+    from pis.reviser import DEFAULT_LR
+    assert tune.DEFAULTS["rev_lr"] == DEFAULT_LR
 
 
 def _row(value, slo_hi, mech="gradient", steps=2, n=10, lo=None, p95=5.0, mx=20.0, va=1.0, va_lo=0.5):
@@ -61,14 +63,17 @@ def _row(value, slo_hi, mech="gradient", steps=2, n=10, lo=None, p95=5.0, mx=20.
 
 
 def test_select_best():
-    rows = [_row(100.0, 1.5), _row(50.0, 0.9, steps=4), _row(50.0, 0.0, steps=2), _row(90.0, 0.0, p95=51.0),
-            _row(80.0, 0.0, mx=501.0), _row(70.0, 0.0, n=9)]
+    rows = [_row(100.0, 1.5), _row(50.0, 0.9, steps=4), _row(50.0, 0.0, steps=2), _row(90.0, 0.0, p95=101.0),
+            _row(80.0, 0.0, mx=1001.0), _row(70.0, 0.0, n=9)]
     best, feas, beats, beats_a = tune.select_best(rows, 1.0, n_seeds=10)
     assert feas == [False, True, True, False, False, False]
     assert best == 2 and beats and beats_a                    # tie on value: fewer steps
     _, _, beats, beats_a = tune.select_best([_row(5.0, 0.0, lo=-1.0, va=-1.0)], 1.0, n_seeds=10)
     assert not beats and not beats_a
     assert tune.select_best([_row(5.0, 2.0)], 1.0, n_seeds=10)[0] is None
+    # background-QoS gate, 2x the official 50 / 500 ms
+    assert (tune.GATE_P95_MS, tune.GATE_MAX_MS) == (100.0, 1000.0)
+    assert tune.select_best([_row(5.0, 0.0, p95=99.0, mx=999.0)], 1.0, n_seeds=10)[1] == [True]
 
 
 def test_revision_stats_and_exploit_rate():
@@ -78,7 +83,7 @@ def test_revision_stats_and_exploit_rate():
     recs = [rec(rev_trigger=None, revised=False),
             rec(rev_trigger="slo", revised=False, rev_ms=3.0),
             rec(rev_trigger="untrusted", revised=True, rev_ms=4.0, rev_pred_reward_gain=0.5, rev_real_gain=-0.1,
-                consequences=cons),
+                rev_real_gain_vs_greedy=0.2, consequences=cons),
             rec(rev_trigger="slo", revised=True, rev_ms=5.0, rev_pred_reward_gain=0.5, rev_real_gain=0.3,
                 consequences=cons)]
     s = tune.revision_stats(recs)
@@ -86,6 +91,9 @@ def test_revision_stats_and_exploit_rate():
     assert s["rev_ms_max"] == 5.0 and s["consequences_mean"]["b_rate"] == 2.0
     agg = tune.aggregate_revisions([s, tune.revision_stats(recs[:2])])
     assert agg["exploit_rate"] == pytest.approx(0.5) and agg["real_gain_mean"] == pytest.approx(0.1)
+    assert agg["vs_greedy"] == 1 and agg["real_gain_vs_greedy_mean"] == pytest.approx(0.2)
+    assert not tune.exploit_flagged(agg) and tune.exploit_flagged({"exploit_rate": 0.75})
+    assert not tune.exploit_flagged({"exploit_rate": float("nan")})
     assert math.isnan(tune.aggregate_revisions([tune.revision_stats(recs[:2])])["exploit_rate"])
 
 
@@ -105,12 +113,15 @@ def test_tiny_end_to_end_run(tmp_path):
               "Step A loop vs base"):
         assert s in text
     assert "_rev_lr" not in text
+    assert "background-QoS limits" in text
     assert str(Path.home()) not in text and str(tmp_path) not in text
     def _no_nan(x):
         raise ValueError(f"non-strict JSON constant {x}")
     c = json.loads(cfg.read_text(), parse_constant=_no_nan)
     assert c["members"] == [GATE, GATE] and c["reviser"]["rev_lam"] > 0
     assert isinstance(c["beats_base"], bool) and isinstance(c["beats_step_a"], bool)
+    assert isinstance(c["exploit_flagged"], bool)
+    assert c["exploit_flagged"] == ("flagged for model exploitation" in text)
     assert c["step_a_config"].startswith("<abs>/")
     assert json.loads(raw.read_text())["best"] == res["best"]
 

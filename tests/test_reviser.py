@@ -243,7 +243,8 @@ def test_torch_rollout_matches_numpy_rollout():
 
 
 
-def test_reviser_controller_revises_untrusted_and_calls_propose_once():
+@pytest.mark.parametrize("mech", ["neighbourhood", "gradient"])
+def test_reviser_controller_revises_untrusted_and_calls_propose_once(mech):
     """Members disagree on everything except at the toy optimum; tau gates Step A's best candidate, the
     reviser finds a trusted improvement. propose runs exactly once per window."""
     spec = adapters.make_spec(SEED)
@@ -252,7 +253,7 @@ def test_reviser_controller_revises_untrusted_and_calls_propose_once():
            for i in range(3)]
     ens = stub_ensemble(fns)
     params = P(tau=0.05, lam=0.1, horizon_h=1)
-    ctl = ReviserLoopController(spec, ens, params, mechanism="neighbourhood", rev_steps=12, rev_lam=1.0,
+    ctl = ReviserLoopController(spec, ens, params, mechanism=mech, rev_steps=12, rev_lam=1.0,
                                 probe_real=True, base_ckpt=CKPT)
     calls = []
     orig = ctl.base.propose
@@ -267,8 +268,44 @@ def test_reviser_controller_revises_untrusted_and_calls_propose_once():
         assert i["rev_dis"] <= params.tau and i["rev_pred_gain"] > 0
         assert set(i["consequences"]) >= {"a_p99_ms", "b_rate", "c_work_core_ms", "a_queue_work_ms", "text"}
         assert np.isfinite(i["rev_real_gain"])
+        assert i["rev_trigger"] == "untrusted" and np.isfinite(i["rev_real_gain_vs_greedy"])
+        assert i["chosen"] == int(np.argmax(i["scores"]))          # the revised candidate's start
     for r in recs:
         assert is_valid(r["policy"])
+
+
+def test_reviser_controller_slo_trigger():
+    """Members agree (always trusted); A's predicted p99 is above the SLO while B uses two or more of CPUs
+    4-7 and rises with every B bit there, so Step A's best candidate is revised on the SLO trigger."""
+    spec = adapters.make_spec(SEED)
+    slo = float(spec.a.slo_p99_ms)
+    def fn(pol):
+        bad = _elig_b(pol)[:, 4:].sum(1)
+        return {P99: torch.log1p(slo * (0.8 + 0.15 * bad))}      # unsaturated over-SLO term
+    params = P(tau=np.inf, lam=0.1, horizon_h=1)
+    for mech in ("gradient", "neighbourhood"):
+        ctl = ReviserLoopController(spec, stub_ensemble([fn, fn]), params, mechanism=mech, rev_steps=4,
+                                    base_ckpt=CKPT)
+        infos = [r["info"] for r in run_scenario(SEED, ctl, duration_s=3.0)]
+        slo_rev = [i for i in infos if i["rev_trigger"] == "slo"]
+        assert slo_rev, mech
+        assert any(i["revised"] for i in slo_rev), mech
+        assert all(i["rev_pred_gain"] >= 0 for i in slo_rev)
+        assert not any(i["rev_trigger"] == "untrusted" for i in infos)
+
+
+def test_gradient_flips_a_cpu_bit_at_production_defaults(setting):
+    """Default steps and step size: the gradient mechanism can change CPU eligibility, not only shares/GPUs."""
+    from pis.reviser import DEFAULT_STEPS
+    spec, hist = setting
+    ens = stub_ensemble([toy_fn, toy_fn])
+    start = start_policy()
+    start["workloads"]["B"]["cpu_share"], start["workloads"]["A"]["cpu_share"] = 50, 10   # shares optimal
+    r = revise_detail(spec, hist, start, ens, P(), mechanism="gradient")
+    assert DEFAULT_STEPS["gradient"] <= 4
+    assert r.score > r.start_score
+    assert r.policy["workloads"]["B"]["preferred_cpus"] != start["workloads"]["B"]["preferred_cpus"]
+    assert r.policy["workloads"]["B"]["cpu_share"] == 50
 
 
 def test_reviser_controller_rejects_inactive_penalty():

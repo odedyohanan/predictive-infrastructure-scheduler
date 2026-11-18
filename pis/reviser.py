@@ -7,7 +7,10 @@ the penalty keeps them where the members agree.
 
   gradient       (primary) a relaxed policy - CPU eligibility sigmoid(logits), CPU shares softmax(logits),
                  GPU owner softmax(logits) per GPU - is fed to every member's differentiable rollout (same
-                 conventions as `Ensemble.rollout_batch`); Adam ascends predicted reward - lam * disagreement.
+                 conventions as `Ensemble.rollout_batch`); normalised gradient ascent on predicted reward
+                 - lam * disagreement: each step moves the logit with the largest gradient by `lr` and every
+                 other logit in proportion, so with the default start logit (+-1) and step size (0.6) the
+                 most promising CPU bit flips in two steps while weakly pulled bits stay put.
                  After every step the relaxed policy is projected to a valid discrete policy.
   neighbourhood  (fallback and ablation) best-improvement hill climbing over single edits: flip one CPU
                  bit, move one share step between two workloads, change one GPU owner.
@@ -45,8 +48,8 @@ from worldmodel.features import (STATE_NAMES, encode_input, encode_known, encode
 
 MECHANISMS = ("gradient", "neighbourhood")
 DEFAULT_STEPS = {"gradient": 3, "neighbourhood": 2}   # ~26 ms and ~17 ms at H=3, 5 GRU members
-DEFAULT_LR = 1.0
-INIT_LOGIT = 3.0          # |logit| of a CPU bit or GPU owner at the start policy (sigmoid(3) = 0.95)
+DEFAULT_LR = 0.6           # largest logit move per gradient step
+INIT_LOGIT = 1.0           # |logit| of a CPU bit or GPU owner at the start policy (sigmoid(1) = 0.73)
 _GPU_OWNERS = (None, "B", "C")
 _B, _C = STATE_NAMES.index("b.rate"), STATE_NAMES.index("c.work_core_ms")
 _P99, _Q = STATE_NAMES.index("a.p99_ms"), STATE_NAMES.index("a.queue_work_ms")
@@ -142,6 +145,8 @@ def neighbours(policy: dict) -> list[dict]:
     out = []
     for w in range(len(WL)):
         for k in range(N_CPUS):
+            if e[w, k] and e[w].sum() == 1:         # would leave the workload without a CPU
+                continue
             e2 = e.copy()
             e2[w, k] = not e2[w, k]
             out.append(_build(policy, e2, combo, owner))
@@ -299,15 +304,17 @@ def revise_detail(spec, history: list[tuple[dict, dict]], start_policy: dict, en
         models = list(ens.models)
         tstd = torch.as_tensor(np.asarray(ens.train_std, np.float32))
         ze, zs, zg = _relaxed(start_policy)
-        opt = torch.optim.Adam([ze, zs, zg], lr=lr, maximize=True)
         for _ in range(steps):
             obj = _objective(spec, torch_rollout(models, history, _encode_relaxed(ze, zs, zg), known,
                                                  params.horizon_h), params, lam, tstd)[0]
-            g = torch.autograd.grad(obj, [ze, zs, zg])
-            for z, gz in zip((ze, zs, zg), g):
-                z.grad = torch.nan_to_num(gz, nan=0.0, posinf=0.0, neginf=0.0)
-            opt.step()
+            g = [torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+                 for x in torch.autograd.grad(obj, [ze, zs, zg])]
+            scale = max(float(x.abs().max()) for x in g)
+            if not scale > 0:                       # flat objective: nothing to follow
+                break
             with torch.no_grad():
+                for z, gz in zip((ze, zs, zg), g):
+                    z += lr * gz / scale
                 p = project(start_policy, torch.sigmoid(ze).numpy(), torch.softmax(zs, 0).numpy(),
                             torch.softmax(zg, 1).numpy())
             seen.setdefault(policy_key(p), p)
@@ -342,6 +349,17 @@ def revise(spec, history: list[tuple[dict, dict]], start_policy: dict, ens, para
     return revise_detail(spec, history, start_policy, ens, params, steps, **kw).policy
 
 
+def warm_up(ens, seed: int) -> None:
+    """One throwaway revision of each mechanism, so torch's one-off first-call costs (autograd set-up,
+    allocator) are paid at start-up instead of by the first timed decision."""
+    from pis.adapters import initial_policy, make_sim, make_spec
+    sim, pol = make_sim(seed), initial_policy()
+    hist = [(sim.run_window(policy_from_dict(pol)), pol) for _ in range(ens.history)]
+    params = Params(n_candidates_m=1, horizon_h=1, lam=1.0, mu=0.0, change_cost=0.0, tau=float("inf"))
+    for mech in MECHANISMS:
+        revise_detail(make_spec(seed), hist, pol, ens, params, 1, mechanism=mech)
+
+
 def predicted_violation(spec, rollout: np.ndarray) -> bool:
     """One policy's rollouts [N, H, 39]: does the members' mean A p99 exceed the SLO in any window?"""
     p99 = np.maximum(np.expm1(np.asarray(rollout, np.float64)[..., _P99]), 0.0).mean(axis=0)
@@ -355,7 +373,7 @@ class ReviserLoopController(LoopController):
     The revised policy replaces Step A's decision only when its revision score beats the start's and, with
     the fallback gate on, its disagreement is within tau; otherwise Step A's decision stands (greedy
     fallback when untrusted). `probe_real=True` (needs attach_sim) also runs both the start and the revised
-    policy for `horizon_h` windows in copies of the real simulator after the decision is timed, to detect
+    policy (and, when the start was untrusted, the greedy fallback) for `horizon_h` windows in copies of the real simulator after the decision is timed, to detect
     model exploitation (predicted gain, real loss).
     """
 
@@ -394,10 +412,10 @@ class ReviserLoopController(LoopController):
                     rev_dis=r.disagreement, rev_start_dis=r.start_disagreement)
         if not accept:
             return policy, info
-        d.fallback, d.reason = False, "revised"
+        d.fallback, d.reason, d.chosen = False, "revised", best
         info.update(revised=True, consequences=consequences(r.rollout, r.start_rollout))
         if self.probe_real:
-            self._probe = (cands[best], r.policy, current)
+            self._probe = (cands[best], r.policy, current, greedy if trigger == "untrusted" else None)
         return r.policy, info
 
     def _real_score(self, policy: dict, current: dict) -> float:
@@ -414,7 +432,10 @@ class ReviserLoopController(LoopController):
         if self._probe is not None:
             if self.sim is None:
                 raise RuntimeError("probe_real needs attach_sim(sim) (run_scenario does this)")
-            start, revised, cur = self._probe
-            info["rev_real_gain"] = self._real_score(revised, cur) - self._real_score(start, cur)
+            start, revised, cur, greedy = self._probe
+            real_rev = self._real_score(revised, cur)
+            info["rev_real_gain"] = real_rev - self._real_score(start, cur)
+            if greedy is not None:                  # untrusted: what Step A would have applied instead
+                info["rev_real_gain_vs_greedy"] = real_rev - self._real_score(greedy, cur)
             self._probe = None
         return policy, info
