@@ -51,6 +51,8 @@ def run_scenario(seed: int, controller: Controller, duration_s: float = 60.0) ->
     record's policy is never applied (the run is over).
     """
     sim = make_sim(seed, duration_s)
+    if hasattr(controller, "attach_sim"):      # oracle controllers branch the real simulator
+        controller.attach_sim(sim)
     current = initial_policy()
     records: list[dict] = []
     history: list[tuple[dict, dict]] = []
@@ -65,6 +67,42 @@ def run_scenario(seed: int, controller: Controller, duration_s: float = 60.0) ->
         current = policy
         tel = sim.run_window(policy_from_dict(current))
     return records
+
+
+def scenario_metrics(records: list[dict], spec) -> dict:
+    """Per-scenario metrics of a `run_scenario` result.
+
+    value_per_s as in `sched.rl.reward` (B batches x value + C core-ms x value, per second); SLO v1/v2 window
+    violation % (`sim.slo.window_violation`); A late % = late requests / arrivals; policy changes between
+    the policies actually in force; the overdue A queue at the end of the last window; decision time; and,
+    for loop controllers, the fallback rate and how often the base scheduler's greedy policy was applied.
+    """
+    from pis.candidates import policy_key
+    from sim.slo import window_violation
+    tels = [r["tel"] for r in records]
+    dur = sum(t["window_s"] for t in tels)
+    b = sum(t["b"]["batches"] for t in tels)
+    c = sum(t["c"]["work_core_ms"] for t in tels)
+    slo = spec.a.slo_p99_ms
+    applied = [initial_policy()] + [r["policy"] for r in records[:-1]]
+    keys = [policy_key(p) for p in applied]
+    ms = np.array([r["info"].get("decide_ms", np.nan) for r in records], dtype=float)
+    fb = [r["info"]["fallback"] for r in records if "fallback" in r["info"]]
+    greedy = [r["info"]["chose_greedy"] for r in records if "chose_greedy" in r["info"]]
+    return {
+        "windows": len(records),
+        "value_per_s": float((spec.b.value_per_batch * b + spec.c.value_per_core_ms * c) / dur),
+        "slo_v1_pct": 100.0 * float(np.mean([window_violation(t, slo, "v1") for t in tels])),
+        "slo_v2_pct": 100.0 * float(np.mean([window_violation(t, slo, "v2") for t in tels])),
+        "a_late_pct": 100.0 * sum(t["a"]["late_new"] for t in tels) / max(sum(t["a"]["arrivals"] for t in tels), 1),
+        "a_queue_overdue_end": int(tels[-1]["a"]["queue_overdue"]),
+        "policy_changes": int(sum(a != b for a, b in zip(keys, keys[1:]))),
+        "decide_ms_mean": float(np.nanmean(ms)),
+        "decide_ms_p95": float(np.nanpercentile(ms, 95)),
+        "decide_ms_max": float(np.nanmax(ms)),
+        "fallback_rate": float(np.mean(fb)) if fb else float("nan"),
+        "greedy_rate": float(np.mean(greedy)) if greedy else float("nan"),
+    }
 
 
 def _sibling_records(records: list[dict], known: dict) -> list[dict]:

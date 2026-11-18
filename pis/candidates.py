@@ -48,6 +48,11 @@ def scheduler_candidates(base, tel: dict, current: dict, m: int, rng: np.random.
     still invalid are dropped here.
     """
     greedy, samples = base.propose(tel, current, m, rng)
+    return candidates_from(greedy, samples, current)
+
+
+def candidates_from(greedy: dict, samples: list[dict], current: dict) -> list[dict]:
+    """Candidate list from one `propose` result: greedy, samples, keep-current; valid, de-duplicated."""
     return _dedup_valid([greedy, *samples, copy.deepcopy(current)])
 
 
