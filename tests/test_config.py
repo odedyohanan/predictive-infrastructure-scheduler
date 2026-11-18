@@ -31,3 +31,12 @@ def test_setup_imports_idempotent():
     n = len(sys.path)
     config.setup_imports()
     assert len(sys.path) == n
+
+
+def test_setup_imports_error_does_not_echo_absolute_env_path(monkeypatch):
+    absolute = "/" + "Users" + "/someone/missing_repo"
+    monkeypatch.setenv("SCHED_REPO", absolute)
+    with pytest.raises(FileNotFoundError) as e:
+        config.setup_imports()
+    assert absolute not in str(e.value)
+    assert "SCHED_REPO" in str(e.value)
