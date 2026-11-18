@@ -13,9 +13,9 @@ import torch  # noqa: E402
 from sched.controllers import isolated_policy  # noqa: E402
 from sched.dataset import policy_dict  # noqa: E402
 from sched.randomize import known_params  # noqa: E402
-from sched.rl import apply_action, greedy_action, sample_action  # noqa: E402
+from sched.rl import apply_action, greedy_action, log_prob, sample_action  # noqa: E402
 from sched.student.data import normalise_one  # noqa: E402
-from sched.student.features import encode  # noqa: E402
+from sched.student.features import encode, encode_target  # noqa: E402
 from sched.student.model import load  # noqa: E402
 from sim.randomize import random_spec  # noqa: E402
 from sim.simulator import Simulator  # noqa: E402
@@ -67,3 +67,35 @@ class BaseScheduler:
         samples = [apply_action(sample_action(out, rng), current, repair="model")
                    for _ in range(m)]
         return greedy, samples
+
+    def log_probs(self, tel: dict, current: dict, policies: list[dict]) -> np.ndarray:
+        """log pi(policy | state) of each policy under the scheduler, without advancing its history.
+
+        A policy equal to `current` can be reached by "no change" or by a change to the same fields; both
+        are summed. A policy outside the scheduler's answer space (e.g. off-grid shares) gets -inf.
+        """
+        x = encode(tel, current, self.known, self.history)
+        with torch.no_grad():
+            out = self.model(normalise_one(x, self.norm, current))
+            cur_key = _fields_key(current)
+            res = []
+            for p in policies:
+                t = encode_target(p)
+                lp = -np.inf
+                if t is not None:
+                    act = {"gate": torch.ones(1), "elig": torch.from_numpy(t["elig"])[None],
+                           "share": torch.tensor([int(t["share"])]),
+                           "gpu": torch.from_numpy(t["gpu"])[None]}
+                    lp = float(log_prob(out, act)[0])
+                if _fields_key(p) == cur_key:
+                    keep = {"gate": torch.zeros(1), "elig": torch.zeros(1, 3, 8),
+                            "share": torch.zeros(1, dtype=torch.long), "gpu": torch.zeros(1, 2, dtype=torch.long)}
+                    lp = float(np.logaddexp(lp, float(log_prob(out, keep)[0])))
+                res.append(lp)
+        return np.array(res)
+
+
+def _fields_key(p: dict) -> tuple:
+    wl = p["workloads"]
+    return tuple((tuple(sorted(wl[w]["preferred_cpus"])) or tuple(range(8)), wl[w]["cpu_share"],
+                  tuple(sorted(wl[w]["gpus"]))) for w in ("A", "B", "C"))

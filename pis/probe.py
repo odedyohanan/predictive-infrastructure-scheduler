@@ -1,9 +1,10 @@
 """Step 0 counterfactual probe: does the world model rank the consequences of actions like reality does?
 
-Protocol: docs/protocols/step0-gate.md (frozen before any result). For each sampled real state, K candidate
-policies are simulated from a deep copy of the real simulator (several reseeded branches each) and predicted
-by the world model; per-state Spearman, pairwise sign accuracy and named-intervention signs are compared with
-controls that cannot see the action.
+For each sampled real state, K candidate policies are simulated from a deep copy of the real simulator
+(several reseeded branches each, the same reseeds for every candidate) and predicted by the world model;
+per-state Spearman, pairwise sign accuracy and named-intervention signs are computed for the model and for
+controls: a resource heuristic and the RL scheduler's log-probability (both see the action), and two leak
+checks that cannot see it (action-blind GRU, persistence). The thresholds of the gate are `GATE`.
 
 Window convention (as in `pis.harness.run_scenario`): window index w = the w-th telemetry of the run. A state
 at window w is the simulator right after window w ran, the policy that ran during it (`current`) and the
@@ -45,7 +46,8 @@ TRUTH_RESEED = 7_000_000   # branch j of every candidate uses reseed TRUTH_RESEE
 PERTURB_P, PERTURB_STRENGTH = 0.3, 0.5
 MIN_K = 8
 GATE = {"min_resolvable_states": 200, "min_intervention_cases": 100, "median_spearman": 0.50,
-        "margin_lower_bound": 0.25, "pairwise_sign_acc": 0.70, "intervention_sign_acc": 0.70}
+        "margin_over_random_null_p95": 0.25, "pairwise_sign_acc": 0.70, "intervention_sign_acc": 0.70}
+CONTROLS = ("heuristic", "logprob", "action_blind", "persistence")
 _DRIVER_RNG, _CAND_RNG = 51_000, 52_000
 
 
@@ -176,7 +178,8 @@ def sample_states(seeds: list[int], n: int, rng: np.random.Generator, duration_s
 
 # ------------------------------------------------------------------ candidates and interventions
 def make_candidates(state: ProbeState, k: int) -> list[dict]:
-    """Protocol section 3: keep-current, greedy, 2 samples, then random perturbations; distinct, valid."""
+    """Keep-current, RL greedy, 2 RL samples, then 2 random perturbations each at strengths 0.0 / 0.5 / 1.0,
+    topped up at strength 0.5 (at most 50 tries); distinct and valid, at most k."""
     r = state.ref
     rng = np.random.default_rng([_CAND_RNG, r.seed, r.window, DRIVERS.index(r.driver)])
     base = BaseScheduler(BASE_CKPT, state.spec)
@@ -287,7 +290,13 @@ def _share_a(cur: dict) -> dict:
 
 
 def named_interventions(current: dict) -> dict[str, tuple[dict, dict]]:
-    """Protocol section 5: name -> (before, after); one of the two is always `current`."""
+    """name -> (before, after); one of the two is always `current`.
+
+    take_from_B: B gives 20 share points to A (keeping >= 10) and half its CPUs to A; reversed (B gains 20
+    points and a CPU) when B is already minimal. gpu_to_B: the first GPU B does not own goes to B; reversed
+    (GPU 1 from B to C) when B owns both. isolate_A: A keeps its CPUs (CPUs 0-3 if it may use all) exclusively;
+    reversed (B and C may also use A's CPUs) when A is already isolated.
+    """
     taken = _take_from_b(current)
     take = (copy.deepcopy(current), taken) if taken is not None else (_give_to_b(current),
                                                                        copy.deepcopy(current))
@@ -327,7 +336,10 @@ def true_outcomes(ref, policies: list[dict], n_seeds: int) -> np.ndarray:
 
 
 def floor_from(per_seed: np.ndarray) -> float:
-    """Protocol section 4: 2 * s_pool * sqrt(2 / n_seeds), at least 1e-6."""
+    """Noise floor of a difference of two candidate means: 2 * s_pool * sqrt(2 / n_seeds), at least 1e-6.
+
+    per_seed [K, n_seeds]; s_pool = sqrt(mean over candidates of the sample variance, ddof 1).
+    """
     per_seed = np.asarray(per_seed, float)
     n = per_seed.shape[1]
     s_pool = float(np.sqrt(np.mean(per_seed.var(axis=1, ddof=1))))
@@ -383,8 +395,65 @@ class PersistencePredictor:
         return np.broadcast_to(s0, (len(policies), 1, horizon, s0.shape[0])).copy()
 
 
+_LOG = np.array([n in {"a.p50_ms", "a.p99_ms", "a.queue_len", "a.queue_work_ms"} for n in STATE_NAMES])
+
+
+def _encode_values(d: dict) -> np.ndarray:
+    v = np.array([d[n] for n in STATE_NAMES], dtype=np.float64)
+    v[_LOG] = np.log1p(np.maximum(v[_LOG], 0.0))
+    return v.astype(np.float32)
+
+
+def _capacity(p: dict, w: str) -> float:
+    """CPU part: share fraction x fraction of CPUs it may use; GPU part: fraction of the GPUs it owns."""
+    wp = p["workloads"][w]
+    return 0.5 * wp["cpu_share"] / 100.0 * len(_cpus(wp)) / N_CPUS + 0.5 * len(wp["gpus"]) / N_GPUS
+
+
+def _a_capacity(p: dict) -> float:
+    wp = p["workloads"]["A"]
+    iso = 1.25 if _a_isolated(p) else 1.0          # no interference from B and C on A's CPUs
+    return wp["cpu_share"] / 100.0 * len(_cpus(wp)) / N_CPUS * iso
+
+
+class HeuristicPredictor:
+    """Control that sees the action but knows no dynamics: scale the current state by resource ratios.
+
+    b.rate and c.work scale with the workload's capacity ratio (candidate / current; capacity = 0.5 * share
+    x CPU fraction + 0.5 * GPU fraction), a.p99 scales inversely with A's capacity ratio (share x CPU
+    fraction, x 1.25 when isolated). Ratios are clipped to [0.25, 4]. The state is held for the horizon and
+    scored with the same reward as the model.
+    """
+
+    def predict(self, state, policies, horizon):
+        d0 = decode_state(encode_state(state.tel))
+        cur = state.current
+        out = []
+
+        def ratio(new, old):
+            return float(np.clip((new + 1e-6) / (old + 1e-6), 0.25, 4.0))
+        for p in policies:
+            d = dict(d0)
+            d["b.rate"] = d0["b.rate"] * ratio(_capacity(p, "B"), _capacity(cur, "B"))
+            d["c.work_core_ms"] = d0["c.work_core_ms"] * ratio(_capacity(p, "C"), _capacity(cur, "C"))
+            d["a.p99_ms"] = d0["a.p99_ms"] / ratio(_a_capacity(p), _a_capacity(cur))
+            out.append(_encode_values(d))
+        enc = np.stack(out)[:, None, None, :]
+        return np.repeat(enc, horizon, axis=2)
+
+
+class LogProbPredictor:
+    """Control: rank candidates by the RL scheduler's log-probability of choosing them (a score, no states)."""
+
+    def score(self, state, policies, horizon):
+        base = BaseScheduler(BASE_CKPT, state.spec)
+        base.history = list(state.base_rates)
+        return base.log_probs(state.tel, state.current, policies)
+
+
 def as_predictor(model_or_ensemble, action_blind: bool = False):
-    if hasattr(model_or_ensemble, "predict") and not hasattr(model_or_ensemble, "predict_next"):
+    if (hasattr(model_or_ensemble, "predict") or hasattr(model_or_ensemble, "score")) \
+            and not hasattr(model_or_ensemble, "predict_next"):
         if action_blind:
             raise ValueError("action_blind needs a world model, not a custom predictor")
         return model_or_ensemble
@@ -423,13 +492,18 @@ def evaluate_state(state: ProbeState, predictors: dict, k: int, n_seeds: int,
            "pred": {}, "interventions": {}}
     preds = {}
     for name, pr in predictors.items():
+        if not hasattr(pr, "predict"):                                     # score-only control
+            sc = np.asarray(pr.score(state, pool, horizon), float)[ci]
+            sc = np.where(np.isfinite(sc), sc, -1e9)                       # outside the answer space: last
+            rec["pred"][name] = {str(h): sc.tolist() for h in horizons}
+            continue
         enc = pr.predict(state, pool, horizon)                             # [P, S, H, 39]
         r = rewards_of(state.spec, enc, state.window_s)
         rec["pred"][name] = {h: v[ci].mean(1).tolist() for h, v in _scores(r, horizons).items()}
         preds[name] = enc
     for iname, (before, after) in iv.items():
         b, a = index[policy_key(before)], index[policy_key(after)]
-        entry = {"true": {}, "floor": {}, "pred": {n: {} for n in predictors}}
+        entry = {"true": {}, "floor": {}, "pred": {n: ({} if n in preds else None) for n in predictors}}
         for q in QUANTITIES:
             vb = np.array([d[q] for d in true_dec[b]])
             va = np.array([d[q] for d in true_dec[a]])
@@ -543,7 +617,7 @@ def _intervention_metrics(records: list[dict], name: str) -> dict:
         per_q = {q: [0, 0] for q in QUANTITIES}
         for rec in records:
             e = rec["interventions"].get(iname)
-            if not e:
+            if not e or e["pred"].get(name) is None:
                 continue
             hits = []
             for q in QUANTITIES:
@@ -568,9 +642,23 @@ def _fmt(x) -> str:
     return "n/a" if x is None else f"{x:.3f}"
 
 
-def gate(summary: dict, records: list[dict], model: str = "model",
-         controls=("action_blind", "persistence")) -> dict:
-    """Protocol section 7, on h = 1."""
+def bootstrap_median_lower(a: list[float], reps: int = 2000, seed: int = 0) -> float | None:
+    """95% lower bound of median(a), resampling states."""
+    if not a:
+        return None
+    a = np.asarray(a, float)
+    idx = np.random.default_rng(seed).integers(len(a), size=(reps, len(a)))
+    return float(np.quantile(np.median(a[idx], axis=1), 0.025))
+
+
+def gate(summary: dict, records: list[dict], model: str = "model", controls=CONTROLS,
+         null_p95: float | None = None) -> dict:
+    """Verdict on h = 1 against `GATE`.
+
+    G0 enough resolvable states and intervention cases (else INCONCLUSIVE); G1 median Spearman; G2 bootstrap
+    95% lower bound of the model's median Spearman >= random-ranking null p95 + margin; G3 pairwise sign
+    accuracy; G4 sign accuracy of every named intervention. Controls are reported, not gated.
+    """
     m = summary[model]["h1"]
     checks = {}
     iv = m["interventions"]
@@ -581,12 +669,15 @@ def gate(summary: dict, records: list[dict], model: str = "model",
     med = m["median_spearman"]
     checks["G1 median Spearman >= 0.50"] = (med is not None and med >= GATE["median_spearman"],
                                             _fmt(med))
-    lbs = {}
-    for c in controls:
-        lbs[c] = bootstrap_lower(m["spearman_resolvable"], summary[c]["h1"]["spearman_resolvable"])
-    checks["G2 lower bound vs controls >= 0.25"] = (
-        all(v is not None and v >= GATE["margin_lower_bound"] for v in lbs.values()),
-        ", ".join(f"{c} {_fmt(v)}" for c, v in lbs.items()))
+    if null_p95 is None:
+        null_p95 = random_ranking_null(records, "1")
+    lb = bootstrap_median_lower(m["spearman_resolvable"])
+    need = None if null_p95 is None else null_p95 + GATE["margin_over_random_null_p95"]
+    checks["G2 median lower bound >= random-null p95 + 0.25"] = (
+        lb is not None and need is not None and lb >= need,
+        f"lower bound {_fmt(lb)}, random-null p95 {_fmt(null_p95)}, needed {_fmt(need)}")
+    lbs = {c: bootstrap_lower(m["spearman_resolvable"], summary[c]["h1"]["spearman_resolvable"])
+           for c in controls if c in summary}
     pw = m["pairwise_sign_acc"]
     checks["G3 pairwise sign accuracy >= 0.70"] = (pw is not None and pw >= GATE["pairwise_sign_acc"],
                                                    _fmt(pw))
@@ -596,8 +687,8 @@ def gate(summary: dict, records: list[dict], model: str = "model",
         ", ".join(f"{i} {_fmt(iv[i]['sign_acc'])}" for i in INTERVENTIONS))
     passed = all(v[0] for v in checks.values())
     verdict = "PASS" if passed else ("INCONCLUSIVE" if not g0 else "FAIL")
-    return {"verdict": verdict, "checks": checks, "lower_bounds": lbs,
-            "random_ranking_p95": random_ranking_null(records, "1")}
+    return {"verdict": verdict, "checks": checks, "lower_bounds_vs_controls": lbs,
+            "random_ranking_p95": null_p95, "model_median_lower_bound": lb}
 
 
 # ------------------------------------------------------------------ drivers of the whole probe

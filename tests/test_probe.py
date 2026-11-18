@@ -160,9 +160,51 @@ def _summary(rho, pw, iv_acc, n_states=300, n_cases=150):
 ])
 def test_gate_thresholds(args, verdict):
     from pis.probe import gate
-    assert gate(_summary(*args), [])["verdict"] == verdict
+    assert gate(_summary(*args), [], null_p95=0.2)["verdict"] == verdict
 
 
 def test_gate_inconclusive_without_enough_states():
     from pis.probe import gate
-    assert gate(_summary(0.9, 0.9, 0.9, n_states=100), [])["verdict"] == "INCONCLUSIVE"
+    assert gate(_summary(0.9, 0.9, 0.9, n_states=100), [], null_p95=0.2)["verdict"] == "INCONCLUSIVE"
+
+
+def test_gate_g2_alone_fails_against_random_ranking_null():
+    from pis.probe import gate
+    s = _summary(0.6, 0.8, 0.8)
+    assert gate(s, [], null_p95=0.2)["verdict"] == "PASS"
+    v = gate(s, [], null_p95=0.5)                 # 0.6 < 0.5 + 0.25
+    assert v["verdict"] == "FAIL"
+    failed = [k for k, (ok, _) in v["checks"].items() if not ok]
+    assert len(failed) == 1 and failed[0].startswith("G2")
+
+
+def test_heuristic_control_sees_the_action(state):
+    from pis.probe import HeuristicPredictor, rewards_of
+    iv = named_interventions(state.current)
+    before, after = iv["gpu_to_B"]
+    enc = HeuristicPredictor().predict(state, [before, after], 2)
+    assert enc.shape == (2, 1, 2, len(enc[0, 0, 0]))
+    from worldmodel.features import decode_state
+    b, a = decode_state(enc[0, 0, 0]), decode_state(enc[1, 0, 0])
+    assert a["b.rate"] > b["b.rate"]                    # more GPU for B -> more B throughput
+    tb, ta = iv["take_from_B"]
+    enc = HeuristicPredictor().predict(state, [tb, ta], 1)
+    assert decode_state(enc[1, 0, 0])["b.rate"] < decode_state(enc[0, 0, 0])["b.rate"]
+    r = rewards_of(state.spec, enc, state.window_s)
+    assert np.isfinite(r).all()
+
+
+def test_logprob_control_scores_candidates(state):
+    from pis.probe import LogProbPredictor, make_candidates
+    cands = make_candidates(state, 6)
+    s = LogProbPredictor().score(state, cands, 1)
+    assert s.shape == (len(cands),)
+    assert np.isfinite(s[:2]).all()                     # keep-current and greedy are in the answer space
+    assert np.ptp(s[np.isfinite(s)]) > 0
+
+
+def test_score_only_predictor_is_reported_without_interventions():
+    from pis.probe import LogProbPredictor
+    res = probe(LogProbPredictor(), REFS[:1], k=6, n_seeds=2, horizon=1)
+    assert len(res["h1"]["spearman_per_state"]) == 1
+    assert all(v["sign_acc"] is None and v["n_cases"] == 0 for v in res["h1"]["interventions"].values())
