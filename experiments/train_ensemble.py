@@ -35,6 +35,7 @@ DATA = "worldmodel:data/adaptive_v1,old_data:teacher_v2,old_data:dagger_r1"
 RECIPE = {"arch": "gru", "history": 8, "hidden": 128, "layers": 2, "lr": 1e-3, "batch": 512,
           "epochs": 300, "patience": 20}
 OFFICIAL_DIR = "models"
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def _git(*args) -> str:
@@ -56,7 +57,7 @@ def check_run(args: dict, dirty: bool, existing: list[str]) -> list[str]:
     smoke = args.get("label") == "smoke"
     if dirty and not smoke:
         errors.append("pis/ or experiments/ have uncommitted changes")
-    if smoke and Path(args["out_dir"]).resolve() == Path(OFFICIAL_DIR).resolve():
+    if smoke and Path(args["out_dir"]).resolve() == (ROOT / OFFICIAL_DIR).resolve():
         errors.append("a smoke run must not write into models/")
     if existing and not args.get("force"):
         errors.append("target exists: " + ", ".join(existing))
@@ -71,6 +72,13 @@ def _arrays(dirs: list[str], split: str, history: int):
     H, _, Y, M, _ = build_history_arrays(recs, history)
     shaper = WorldModel(None, None, None, {"arch": RECIPE["arch"], "history": history})
     return (shaper.prepare(H), Y, M), recs
+
+
+def member_record(job: dict, out: Path) -> dict:
+    """Recipe record of a member; `data` is comma-separated, as in the gate checkpoint's meta."""
+    return {**job["recipe"], "seed": job["seed"], "member": job["member"], "data": ",".join(job["data"]),
+            "out": safe_path(str(out)), "trainer": "worldmodel.train.train_model",
+            "bounds": "worldmodel.bounds.state_bounds(train split)", "code": job["code"], "label": job["label"]}
 
 
 def train_member(job: dict) -> dict:
@@ -96,9 +104,7 @@ def train_member(job: dict) -> dict:
                               log=log, arch=r["arch"], history=r["history"])
     lo, hi = state_bounds(tr_recs)
     out = Path(job["out_dir"]) / f"ens_{n}.pt"
-    rec = {**r, "seed": seed, "member": n, "data": list(job["data"]), "out": safe_path(str(out)),
-           "trainer": "worldmodel.train.train_model", "bounds": "worldmodel.bounds.state_bounds(train split)",
-           "code": job["code"], "label": job["label"]}
+    rec = member_record(job, out)
     model.meta.update({"args": rec, "state_names": STATE_NAMES, "input_names": INPUT_NAMES,
                        "n_train": len(tr[0]), "n_val": len(va[0]), "state_min": lo.tolist(),
                        "state_max": hi.tolist(), "bounds_from": list(job["data"])})

@@ -152,10 +152,10 @@ def test_oracle_selection_picks_true_best():
     params = P(horizon_h=2, n_candidates_m=6, change_cost=0.1)
     ctl = _ctl(StubEnsemble(), selection="oracle", params=params)
     ctl.attach_sim(sim)
-    t_before = sim.t if hasattr(sim, "t") else None
+    t_before = sim.t
+    assert t_before > 0
     pol, info = ctl.decide(tel, cur, hist + [(tel, cur)])
-    if t_before is not None:
-        assert sim.t == t_before                       # the real run is untouched
+    assert sim.t == t_before                           # the real run is untouched
     cands = ctl.last_candidates
     assert len(cands) > 1 and not info["fallback"] and info["reason"] == "oracle"
     true = []
@@ -177,7 +177,21 @@ def test_oracle_without_sim_raises(views):
 def test_decision_time_recorded(views):
     tel, cur, view = views[0]
     _, info = _ctl(StubEnsemble()).decide(tel, cur, view)
-    assert info["decide_ms"] > 0
+    assert info["decide_ms"] > 0 and info["over_hard_limit"] is False
+
+
+class SlowStub(StubEnsemble):
+    def rollout_batch(self, *a):
+        import time
+        time.sleep(0.55)
+        return super().rollout_batch(*a)
+
+
+def test_decision_over_hard_limit_is_recorded_not_aborted(views):
+    tel, cur, view = views[0]
+    pol, info = _ctl(SlowStub(b_of=lambda i: 10.0 * i)).decide(tel, cur, view)
+    assert info["decide_ms"] > 500 and info["over_hard_limit"] is True
+    assert info["reason"] == "model" and not info["fallback"]      # the decision itself is unchanged
 
 
 def test_always_fallback_equals_base_run():
@@ -199,6 +213,6 @@ def test_scenario_metrics_keys(views):
     recs = run_scenario(SEED, BaseGreedyController(spec), duration_s=4.0)
     m = scenario_metrics(recs, spec)
     for k in ("value_per_s", "slo_v1_pct", "slo_v2_pct", "a_late_pct", "policy_changes", "decide_ms_mean",
-              "decide_ms_p95", "a_queue_overdue_end", "fallback_rate", "windows"):
+              "decide_ms_p95", "a_queue_overdue_end", "fallback_rate", "windows", "decisions_over_500ms"):
         assert k in m
     assert m["windows"] == 8 and m["value_per_s"] > 0
