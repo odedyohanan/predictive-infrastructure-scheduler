@@ -51,6 +51,7 @@ class LoopController:
         self.oracle_reseeds = tuple(oracle_reseeds)
         self.sim = None
         self.last_candidates: list[dict] = []
+        self.last_rollouts = None                             # [N, n_cand, H, 39] of the last model selection
 
     def attach_sim(self, sim) -> None:
         """The real simulator of the running episode (read through deep copies only)."""
@@ -60,6 +61,7 @@ class LoopController:
     def _model(self, history, cands, current) -> Decision:
         p = self.params
         roll = self.ensemble.rollout_batch(history, cands, self.known, p.horizon_h)
+        self.last_rollouts = roll
         scores, dis = score_candidates(self.spec, roll, cands, current, p, train_std=self.ensemble.train_std,
                                        lam=p.lam if self.use_uncertainty else 0.0)
         return choose(scores, dis, p, use_fallback=self.use_fallback)
@@ -101,9 +103,16 @@ class LoopController:
         else:
             d = self._model(history, cands, current)
         policy = greedy if d.fallback else cands[d.chosen]
+        policy, extra = self._after_choice(d, cands, greedy, policy, current, history)
         ms = (time.perf_counter() - t0) * 1000.0
         info = {"decide_ms": ms, "over_hard_limit": ms > HARD_LIMIT_MS, "fallback": d.fallback, "reason": d.reason,
                 "chosen": d.chosen, "n_candidates": len(cands), "selection": self.selection,
                 "chose_greedy": policy_key(policy) == policy_key(greedy),
-                "scores": [float(x) for x in d.scores], "disagreement": [float(x) for x in d.disagreement]}
+                "scores": [float(x) for x in d.scores], "disagreement": [float(x) for x in d.disagreement],
+                **extra}
         return policy, info
+
+    def _after_choice(self, d: Decision, cands: list[dict], greedy: dict, policy: dict, current: dict,
+                      history: list[tuple[dict, dict]]) -> tuple[dict, dict]:
+        """Hook for subclasses (Step B revises here): final policy and extra info; inside the timed part."""
+        return policy, {}
