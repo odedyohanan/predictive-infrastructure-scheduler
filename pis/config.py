@@ -31,3 +31,11 @@ def setup_imports() -> None:
         resolved = str(root.resolve())
         if resolved not in sys.path:
             sys.path.insert(0, resolved)
+
+
+def resolve(ref: str) -> Path:
+    """'worldmodel:x', 'sched:x', 'old_data:x' -> path inside that sibling; 'local:x' or 'x' -> x here."""
+    key, sep, rest = ref.partition(":")
+    if sep and key in _DEFAULTS:
+        return sibling_paths()[key] / rest
+    return Path(rest if sep and key == "local" else ref)

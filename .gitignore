@@ -12,3 +12,4 @@ logs/
 .env
 *.local
 results/raw/
+models/

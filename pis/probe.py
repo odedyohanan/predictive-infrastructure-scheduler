@@ -564,6 +564,10 @@ def _intervention_metrics(records: list[dict], name: str) -> dict:
     return out
 
 
+def _fmt(x) -> str:
+    return "n/a" if x is None else f"{x:.3f}"
+
+
 def gate(summary: dict, records: list[dict], model: str = "model",
          controls=("action_blind", "persistence")) -> dict:
     """Protocol section 7, on h = 1."""
@@ -576,20 +580,20 @@ def gate(summary: dict, records: list[dict], model: str = "model",
                                         + ", ".join(f"{i} {iv[i]['n_cases']}" for i in INTERVENTIONS))
     med = m["median_spearman"]
     checks["G1 median Spearman >= 0.50"] = (med is not None and med >= GATE["median_spearman"],
-                                            f"{med}")
+                                            _fmt(med))
     lbs = {}
     for c in controls:
         lbs[c] = bootstrap_lower(m["spearman_resolvable"], summary[c]["h1"]["spearman_resolvable"])
     checks["G2 lower bound vs controls >= 0.25"] = (
         all(v is not None and v >= GATE["margin_lower_bound"] for v in lbs.values()),
-        ", ".join(f"{c} {v}" for c, v in lbs.items()))
+        ", ".join(f"{c} {_fmt(v)}" for c, v in lbs.items()))
     pw = m["pairwise_sign_acc"]
     checks["G3 pairwise sign accuracy >= 0.70"] = (pw is not None and pw >= GATE["pairwise_sign_acc"],
-                                                   f"{pw}")
+                                                   _fmt(pw))
     checks["G4 interventions sign accuracy >= 0.70"] = (
         all(iv[i]["sign_acc"] is not None and iv[i]["sign_acc"] >= GATE["intervention_sign_acc"]
             for i in INTERVENTIONS),
-        ", ".join(f"{i} {iv[i]['sign_acc']}" for i in INTERVENTIONS))
+        ", ".join(f"{i} {_fmt(iv[i]['sign_acc'])}" for i in INTERVENTIONS))
     passed = all(v[0] for v in checks.values())
     verdict = "PASS" if passed else ("INCONCLUSIVE" if not g0 else "FAIL")
     return {"verdict": verdict, "checks": checks, "lower_bounds": lbs,
