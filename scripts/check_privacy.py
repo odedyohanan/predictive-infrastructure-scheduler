@@ -34,8 +34,8 @@ def scan(root: Path) -> list[str]:
         if not path.is_file():
             continue
         try:
-            lines = path.read_text().splitlines()
-        except (UnicodeDecodeError, OSError):
+            lines = path.read_text(errors="replace").splitlines()
+        except OSError:
             continue
         rel = path.relative_to(root)
         for n, line in enumerate(lines, 1):

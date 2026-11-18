@@ -5,6 +5,8 @@ import os
 import sys
 from pathlib import Path
 
+from pis.privacy import scrub
+
 _DEFAULTS = {
     "sched": ("SCHED_REPO", "../priority-scheduler"),
     "worldmodel": ("WORLDMODEL_REPO", "../scheduler-simulation-model"),
@@ -24,7 +26,7 @@ def setup_imports() -> None:
         root = paths[key]
         if not root.is_dir():
             raise FileNotFoundError(
-                f"sibling repo '{key}' not found at '{root}' (set {_DEFAULTS[key][0]})"
+                f"sibling repo '{key}' not found at '{scrub(str(root))}' (set {_DEFAULTS[key][0]})"
             )
         resolved = str(root.resolve())
         if resolved not in sys.path:

@@ -51,3 +51,10 @@ def test_denylist_local_is_used(tmp_path):
     assert _run(repo) == 0
     (repo / ".privacy-denylist.local").write_text("secretword\n")
     assert _run(repo) == 1
+
+
+def test_check_privacy_does_not_skip_undecodable_files(tmp_path):
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "bin.txt").write_bytes(b"\xff\xfe junk " + (HOME_PREFIX + "someone/x").encode())
+    subprocess.run(["git", "add", "bin.txt"], cwd=tmp_path, check=True)
+    assert _run(tmp_path) == 1
