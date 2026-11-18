@@ -30,17 +30,20 @@ def _policies(n: int) -> list[dict]:
 
 
 def _history(n: int) -> list[tuple[dict, dict]]:
-    """n real windows; each entry is (telemetry, policy in force while it was measured)."""
+    """n real windows as (tel_t, policy applied in the window after t); the newest policy is a
+    placeholder (rollout_batch replaces it by each candidate)."""
     from sim.policy import policy_from_dict
     sim = adapters.make_sim(SEED)
-    hist = []
-    for pd in _policies(n):
-        hist.append((sim.run_window(policy_from_dict(pd)), pd))
-    return hist
+    pols = _policies(n + 1)
+    tels = [sim.run_window(policy_from_dict(pols[0]))]
+    for pd in pols[1:n]:
+        tels.append(sim.run_window(policy_from_dict(pd)))
+    return list(zip(tels, pols[1:]))
 
 
-def test_batch_equals_single(model):
-    hist, known = _history(12), adapters.known_of(adapters.make_spec(SEED))
+@pytest.mark.parametrize("n_hist", [12, 1, 2])
+def test_batch_equals_single(model, n_hist):
+    hist, known = _history(n_hist), adapters.known_of(adapters.make_spec(SEED))
     cands = _policies(4)
     batch = rollout_batch(model, hist, cands, known, 5)
     for i, c in enumerate(cands):
