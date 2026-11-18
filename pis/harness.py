@@ -100,6 +100,7 @@ def scenario_metrics(records: list[dict], spec) -> dict:
         "decide_ms_mean": float(np.nanmean(ms)),
         "decide_ms_p95": float(np.nanpercentile(ms, 95)),
         "decide_ms_max": float(np.nanmax(ms)),
+        "decisions_over_500ms": int(sum(bool(r["info"].get("over_hard_limit", False)) for r in records)),
         "fallback_rate": float(np.mean(fb)) if fb else float("nan"),
         "greedy_rate": float(np.mean(greedy)) if greedy else float("nan"),
     }

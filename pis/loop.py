@@ -23,6 +23,7 @@ import numpy as np
 from pis.adapters import BaseScheduler, clone_sim, known_of
 from pis.candidates import candidates_from, policy_key
 from pis.config import setup_imports
+from pis.ensemble import N_STATE
 from pis.evaluator import Decision, Params, choose, score_candidates
 
 setup_imports()
@@ -31,6 +32,7 @@ from sim.policy import policy_from_dict  # noqa: E402
 from worldmodel.features import encode_state  # noqa: E402
 
 BASE_CKPT = "models/rl_r6/final.pt"
+HARD_LIMIT_MS = 500.0      # one window; exceeding it is recorded, never cut short (results stay deterministic)
 SELECTIONS = ("model", "random", "oracle")
 
 
@@ -71,7 +73,7 @@ class LoopController:
         if self.sim is None:
             raise RuntimeError("oracle selection needs attach_sim(sim) (run_scenario does this)")
         p = self.params
-        real = np.empty((len(self.oracle_reseeds), len(cands), p.horizon_h, 39), dtype=np.float32)
+        real = np.empty((len(self.oracle_reseeds), len(cands), p.horizon_h, N_STATE), dtype=np.float32)
         for i, c in enumerate(cands):
             pol = policy_from_dict(c)
             for j, rs in enumerate(self.oracle_reseeds):
@@ -99,7 +101,8 @@ class LoopController:
         else:
             d = self._model(history, cands, current)
         policy = greedy if d.fallback else cands[d.chosen]
-        info = {"decide_ms": (time.perf_counter() - t0) * 1000.0, "fallback": d.fallback, "reason": d.reason,
+        ms = (time.perf_counter() - t0) * 1000.0
+        info = {"decide_ms": ms, "over_hard_limit": ms > HARD_LIMIT_MS, "fallback": d.fallback, "reason": d.reason,
                 "chosen": d.chosen, "n_candidates": len(cands), "selection": self.selection,
                 "chose_greedy": policy_key(policy) == policy_key(greedy),
                 "scores": [float(x) for x in d.scores], "disagreement": [float(x) for x in d.disagreement]}

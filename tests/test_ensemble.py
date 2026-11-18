@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -112,3 +114,16 @@ def test_train_ensemble_guards(tmp_path):
     assert te.check_run({**ok, "label": "smoke", "out_dir": str(tmp_path)}, dirty=True, existing=[]) == []
     assert te.RECIPE == {"arch": "gru", "history": 8, "hidden": 128, "layers": 2, "lr": 1e-3,
                          "batch": 512, "epochs": 300, "patience": 20}
+
+
+def test_train_ensemble_smoke_guard_uses_repo_root_and_data_string(tmp_path, monkeypatch):
+    from tests._load import ROOT, load_script
+    te = load_script("train_ensemble")
+    monkeypatch.chdir(tmp_path)                       # cwd is not the repo
+    smoke = {"label": "smoke", "force": False}
+    assert te.check_run({**smoke, "out_dir": str(ROOT / "models")}, dirty=False, existing=[])
+    assert te.check_run({**smoke, "out_dir": "models"}, dirty=False, existing=[]) == []   # tmp/models
+    job = {"member": 2, "seed": 2, "data": ["worldmodel:data/adaptive_v1", "old_data:teacher_v2"],
+           "out_dir": "models", "code": "git HEAD x", "label": "", "recipe": dict(te.RECIPE)}
+    rec = te.member_record(job, Path("models/ens_2.pt"))
+    assert rec["data"] == "worldmodel:data/adaptive_v1,old_data:teacher_v2" and rec["seed"] == 2

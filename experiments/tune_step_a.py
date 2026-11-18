@@ -15,7 +15,7 @@ bound of (loop - base) SLO v2 window-violation % is at most +`slo_margin` percen
 
 Seeds: only development seeds 1100-1199 are accepted (always, smoke runs included); calibration and
 evaluation seeds must not overlap. A run refuses to start with uncommitted changes in pis/ or experiments/,
-when the grid exceeds --max-configs, or when the results note already exists. `--label smoke` lifts the
+when the grid exceeds --max-configs, or when the results note or the config already exists. `--label smoke` lifts the
 dirty-tree and duration checks but may not write the official note or config.
 Outputs: results/step_a/tuning.md (note), configs/step_a.json (chosen Params, relative member paths),
 results/raw/step_a/tuning<_label>.json (every per-scenario number; gitignored).
@@ -79,7 +79,7 @@ def grid(a: dict) -> list[dict]:
                                                      _floats(a["grid_lam"]), _tau_qs(a["grid_tau_q"]))]
 
 
-def check_run(a: dict, dirty: bool, note_exists: bool, n_members: int) -> list[str]:
+def check_run(a: dict, dirty: bool, note_exists: bool, config_exists: bool, n_members: int) -> list[str]:
     """Errors that refuse the run. The seed checks hold for every run, smoke included."""
     errors = []
     calib, seeds = parse_seeds(a["calib_seeds"]), parse_seeds(a["seeds"])
@@ -106,6 +106,8 @@ def check_run(a: dict, dirty: bool, note_exists: bool, n_members: int) -> list[s
             errors.append("duration differs from 60 s outside a smoke run")
         if note_exists:
             errors.append("the results note already exists (one tuning run, never overwritten)")
+        if config_exists:
+            errors.append(f"{OFFICIAL_CONFIG} or --config-out already exists (never overwritten)")
     return errors
 
 
@@ -202,22 +204,48 @@ def compare(base: dict[int, dict], arm: dict[int, dict]) -> dict:
         return float(np.mean([arm[s][key] for s in seeds])) if seeds else math.nan
     return {"n": len(seeds), "value": d("value_per_s"), "slo_v2": d("slo_v2_pct"), "slo_v1": d("slo_v1_pct"),
             "late": d("a_late_pct"), "fallback_rate": mean("fallback_rate"), "greedy_rate": mean("greedy_rate"),
-            "decide_p95": mean("decide_ms_p95"), "decide_max": float(max((arm[s]["decide_ms_max"] for s in seeds),
+            "decide_p95": mean("decide_ms_p95"),
+            "decide_p95_worst": float(max((arm[s]["decide_ms_p95"] for s in seeds), default=math.nan)),
+            "decide_max": float(max((arm[s]["decide_ms_max"] for s in seeds),
                                                                        default=math.nan)),
             "changes": mean("policy_changes")}
 
 
-def select_best(rows: list[dict], slo_margin: float) -> tuple[int | None, list[bool]]:
-    """Index of the best feasible row (ties: smaller N*M*H), and the feasibility of every row."""
-    feas = [r["cmp"]["n"] >= 2 and r["cmp"]["slo_v2"]["hi"] <= slo_margin
-            and math.isfinite(r["cmp"]["value"]["mean"]) for r in rows]
+DECIDE_P95_MS, DECIDE_MAX_MS = 50.0, 500.0
+
+
+def _finite_params(p: dict) -> bool:
+    """Every value finite; tau may be the explicit "inf" of a no-gate config, never NaN."""
+    for k, v in p.items():
+        if k == "tau" and v == "inf":
+            continue
+        if not isinstance(v, (int, float)) or not math.isfinite(v):
+            return False
+    return True
+
+
+def select_best(rows: list[dict], slo_margin: float, n_seeds: int) -> tuple[int | None, list[bool], bool]:
+    """(index of the best feasible row, feasibility of every row, whether the best beats the base).
+
+    Feasible: paired results on every evaluation seed; upper 95% bound of the SLO v2 difference <= slo_margin
+    (SLO v1 is reported only); finite params (no NaN tau); worst per-scenario decision p95 <= 50 ms and
+    max <= 500 ms. Best: largest mean value difference, ties -> smaller N*M*H. Beats base: that mean > 0 and
+    its CI lower bound > 0.
+    """
+    def ok(r):
+        m = r["cmp"]
+        return (m["n"] == n_seeds and n_seeds >= 2 and m["slo_v2"]["hi"] <= slo_margin
+                and math.isfinite(m["value"]["mean"]) and _finite_params(r["params"])
+                and m["decide_p95_worst"] <= DECIDE_P95_MS and m["decide_max"] <= DECIDE_MAX_MS)
+    feas = [bool(ok(r)) for r in rows]
     cands = [i for i, f in enumerate(feas) if f]
     if not cands:
-        return None, feas
+        return None, feas, False
     c = rows
     best = max(cands, key=lambda i: (c[i]["cmp"]["value"]["mean"], -c[i]["cfg"]["n"] * c[i]["cfg"]["m"]
                                      * c[i]["cfg"]["h"]))
-    return best, feas
+    v = rows[best]["cmp"]["value"]
+    return best, feas, bool(v["mean"] > 0 and v["lo"] > 0)
 
 
 def _f(x, nd=1) -> str:
@@ -230,12 +258,14 @@ def _ci(s: dict, nd=1) -> str:
 
 
 def render(meta: dict, base_summary: dict, taus: dict, rows: list[dict], best: int | None, feas: list[bool],
-           ablations: dict, failures: list[dict]) -> str:
+           ablations: dict, failures: list[dict], beats_base: bool = False) -> str:
     L = [f"# Step A tuning on development seeds{' (' + meta['label'] + ')' if meta.get('label') else ''}", ""]
     L += [f"- {k}: {v}" for k, v in meta.items() if k != "label" and not k.startswith("_")]
     L += ["", "Paired differences are (loop - base) per scenario, mean [95% CI]. Value in value units per "
           "second; SLO in percentage points of windows violating the SLO. Feasible = upper bound of the "
-          f"SLO v2 difference <= +{meta['slo margin (pp)']} pp.", "",
+          f"SLO v2 difference <= +{meta['slo margin (pp)']} pp (SLO v1 reported only), paired results on every "
+          f"evaluation seed, finite parameters, decision time p95 <= {DECIDE_P95_MS:g} ms in every scenario and max "
+          f"<= {DECIDE_MAX_MS:g} ms.", "",
           "## Base scheduler (R6 greedy)", "",
           f"- scenarios: {base_summary['n']}; mean value per second {_f(base_summary['value'])}; "
           f"SLO v2 {_f(base_summary['slo_v2'], 2)} %; SLO v1 {_f(base_summary['slo_v1'], 2)} %", "",
@@ -262,6 +292,11 @@ def render(meta: dict, base_summary: dict, taus: dict, rows: list[dict], best: i
     if best is None:
         L.append("No configuration met the SLO non-inferiority constraint; no configuration is recommended.")
     else:
+        if not beats_base:
+            v = rows[best]["cmp"]["value"]
+            L += [f"**No configuration beats the base scheduler**: the best feasible configuration's paired value "
+                  f"difference is {_ci(v)}: its mean is not above zero or its 95% CI does not exclude zero. It is "
+                  "recorded below (and in the config with `beats_base: false`) for reference only.", ""]
         L.append(f"`{json.dumps(rows[best]['params'])}` with N = {rows[best]['cfg']['n']} members.")
         L += ["", "Selected as the best of the grid on these seeds, so its paired value difference is "
               "optimistic (winner's curse); only the held-out evaluation measures it."]
@@ -311,7 +346,8 @@ def main(argv=None):
     args = vars(a)
     members = a.members.split(",")
     dirty = bool(_git("status", "--porcelain", "--", "pis", "experiments"))
-    errors = check_run(args, dirty, Path(a.out).exists(), len(members))
+    config_exists = Path(OFFICIAL_CONFIG).exists() or Path(a.config_out).exists()
+    errors = check_run(args, dirty, Path(a.out).exists(), config_exists, len(members))
     if errors:
         raise SystemExit("refusing to run: " + "; ".join(errors))
     from pis.config import resolve
@@ -349,7 +385,7 @@ def main(argv=None):
         for i, c in enumerate(cfgs):
             arm = {r["seed"]: r["metrics"] for r in res2 if r["cfg_id"] == i and "metrics" in r}
             rows.append({"cfg": c, "params": params[i], "cmp": compare(base, arm)})
-        best, feas = select_best(rows, a.slo_margin)
+        best, feas, beats_base = select_best(rows, a.slo_margin, len(seeds))
         ablations, res3 = {}, []
         if best is not None and not a.no_ablations:
             jobs = [{"kind": "ablation", "name": name, "seed": s, "n": cfgs[best]["n"], "params": params[best],
@@ -379,19 +415,20 @@ def main(argv=None):
     base_summary = {"n": len(base), **{k: float(np.mean([m[v] for m in base.values()])) if base else math.nan
                                        for k, v in (("value", "value_per_s"), ("slo_v2", "slo_v2_pct"),
                                                     ("slo_v1", "slo_v1_pct"))}}
-    text = render(meta, base_summary, taus, rows, best, feas, ablations, failures)
+    text = render(meta, base_summary, taus, rows, best, feas, ablations, failures, beats_base)
     meta.pop("_qs")
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(scrub(text))
     if best is not None:
-        cfg = {"members": members[:cfgs[best]["n"]], "params": params[best],
+        cfg = {"members": [safe_path(m) for m in members[:cfgs[best]["n"]]], "params": params[best],
+               "beats_base": beats_base,
                "tau_percentile": cfgs[best]["tau_q"] if math.isfinite(cfgs[best]["tau_q"]) else "inf",
                "selected_on_seeds": a.seeds, "calibration_seeds": a.calib_seeds, "code": head,
                "label": a.label}
         cp = Path(a.config_out)
         cp.parent.mkdir(parents=True, exist_ok=True)
-        cp.write_text(scrub(json.dumps(cfg, indent=1)) + "\n")
+        cp.write_text(scrub(json.dumps(cfg, indent=1, allow_nan=False)) + "\n")
     raw = Path(a.raw or f"results/raw/step_a/tuning{'_' + a.label if a.label else ''}.json")
     raw.parent.mkdir(parents=True, exist_ok=True)
     raw.write_text(scrub(json.dumps({"meta": meta, "taus": {k: {str(q): t for q, t in v.items()}
@@ -399,8 +436,8 @@ def main(argv=None):
                                      "rows": rows, "best": best, "base": base, "ablations": ablations,
                                      "runs": [{k: v for k, v in r.items() if k != "pool"}
                                               for r in res1 + res2 + res3]}, default=str)))
-    print(f"chosen config {best} -> {safe_path(str(out))}, runtime {runtime:.0f} s")
-    return {"best": best, "rows": rows, "taus": taus, "ablations": ablations}
+    print(f"chosen config {best} (beats base: {beats_base}) -> {safe_path(str(out))}, runtime {runtime:.0f} s")
+    return {"best": best, "beats_base": beats_base, "rows": rows, "taus": taus, "ablations": ablations}
 
 
 if __name__ == "__main__":
