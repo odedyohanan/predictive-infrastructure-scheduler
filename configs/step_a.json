@@ -1,0 +1,24 @@
+{
+ "members": [
+  "worldmodel:models/gru_mix_bounded.pt",
+  "models/ens_1.pt",
+  "models/ens_2.pt",
+  "models/ens_3.pt",
+  "models/ens_4.pt"
+ ],
+ "params": {
+  "n_candidates_m": 4,
+  "horizon_h": 3,
+  "lam": 1.0,
+  "mu": 8.0,
+  "change_cost": 0.0,
+  "tau": 0.1571656037280141,
+  "slo_lam": 40.0
+ },
+ "beats_base": true,
+ "tau_percentile": 90.0,
+ "selected_on_seeds": "1110-1139",
+ "calibration_seeds": "1100-1109",
+ "code": "c63da9ffedda5ffdd485cced249572e5155b4acc",
+ "label": ""
+}
