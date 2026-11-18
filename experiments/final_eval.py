@@ -238,7 +238,8 @@ def check_run(a: dict, protocol: dict, state: dict) -> list[str]:
         if len(freeze["commits"]) != 1 or freeze["files"] != [PROTOCOL]:
             errors.append(f"{PROTOCOL} must have exactly one commit, touching only that file (found "
                           f"{len(freeze['commits'])} commit(s), files {freeze['files']})")
-        if not _inside(a["out"], OFFICIAL_REPORT) or not _inside(a["raw_dir"], OFFICIAL_RAW):
+        if Path(a["out"]).resolve() != Path(OFFICIAL_REPORT).resolve() or \
+                Path(a["raw_dir"]).resolve() != Path(OFFICIAL_RAW).resolve():
             errors.append(f"a run on the held-out seeds writes {OFFICIAL_REPORT} and {OFFICIAL_RAW}")
         if not 1 <= a["attempt"] <= MAX_ATTEMPTS:
             errors.append(f"attempt must be 1..{MAX_ATTEMPTS}")
@@ -349,6 +350,36 @@ def timing_for(path: str, kind: str, cfg: dict, shas: dict[str, str], official: 
     if mm:
         reasons.append(mm)
     return {"unavailable": f"{path}: " + "; ".join(reasons)} if reasons else t
+
+
+def timing_refusals(steps: dict, shas: dict[str, str], committed) -> list[str]:
+    """Reasons why part (c) could not be satisfied by the timing notes, for an official run (empty: all usable).
+    `committed(path)` says whether a note is committed at HEAD."""
+    out = []
+    for arm, kind, key in (("loop_a", "a", "step_a"), ("loop_b", "b", "step_b")):
+        path = TIMING_NOTES[arm]
+        t = timing_for(path, kind, steps[key], shas, True, committed(path))
+        if "unavailable" in t:
+            out.append(f"{arm} timing unavailable: {t['unavailable']}")
+    return out
+
+
+def pinned_mismatch(prev: dict | None, cur: dict) -> list[str]:
+    """What differs between a previous attempt's run_config and this one in the tuned artefacts that a later
+    attempt must keep: the protocol, the step configs (content hash) and the ensemble members. The code may
+    differ (a fix between attempts is allowed). A value missing from the previous record counts as a mismatch."""
+    if not prev:
+        return ["the previous attempt's run_config.json is missing or empty"]
+    def pick(c):
+        d = {"protocol": (c.get("protocol") or {}).get("sha256")}
+        d.update({f"{k} config": (v or {}).get("sha256") for k, v in (c.get("step_configs") or {}).items()})
+        d.update({k: v for k, v in (c.get("models_sha256") or {}).items() if k.startswith("member ")})
+        return d
+    a, b = pick(prev), pick(cur)
+    keys = sorted(set(a) | set(b))
+    return [f"{k} differs from the previous attempt (or was not recorded)" for k in keys
+            if not a.get(k) or a.get(k) != b.get(k)] or (
+        [] if any(k.startswith("member ") for k in a) else ["no ensemble member recorded by the previous attempt"])
 
 
 def summarise_attempt(raw_attempt: Path) -> str:
@@ -496,6 +527,10 @@ def main(argv=None):
             raise SystemExit(f"{name} checkpoint differs from the protocol (sha256 {sha[:16]})")
         models[f"{name} sched:{d['checkpoint']}"] = sha
 
+    if official:                      # part (c) needs usable timing notes: refuse before any simulation starts
+        bad = timing_refusals(steps, shas, committed_clean)
+        if bad:
+            raise SystemExit("refusing to run: " + "; ".join(bad))
     head = _git("rev-parse", "HEAD")[1] or "unknown"
     probe_every = int(protocol["metrics"].get("probe_every", 0))
     import numpy
@@ -530,6 +565,15 @@ def main(argv=None):
             "run-time probe": f"every {probe_every}th model decision",
             "raw": safe_path(str(raw_attempt)) if not official else f"{OFFICIAL_RAW}/attempt{a.attempt}/"}
     prev = Path(a.raw_dir) / f"attempt{a.attempt - 1}"
+    if official and a.attempt > 1:
+        try:
+            prev_cfg = json.loads((prev / "run_config.json").read_text())
+        except (OSError, ValueError):
+            prev_cfg = None
+        bad = pinned_mismatch(prev_cfg, config)
+        if bad:
+            raise SystemExit("refusing to run: attempt " + str(a.attempt) + " must use the tuned artefacts of "
+                             "attempt " + str(a.attempt - 1) + ": " + "; ".join(bad))
     if a.attempt > 1 and prev.is_dir():
         meta["previous attempt"] = f"attempt {a.attempt - 1}: {summarise_attempt(prev)}"
     raw_attempt.mkdir(parents=True, exist_ok=False)          # never overwrite an earlier attempt
