@@ -124,6 +124,22 @@ def test_tiny_end_to_end_run(tmp_path):
     assert c["exploit_flagged"] == ("flagged for model exploitation" in text)
     assert c["step_a_config"].startswith("<abs>/")
     assert json.loads(raw.read_text())["best"] == res["best"]
+    # re-selection from the raw runs, with another decision-time gate: no simulation, same rows
+    out2, cfg2, raw2 = tmp_path / "r2.md", tmp_path / "c2.json", tmp_path / "r2.json"
+    common = ["--step-a-config", str(step_a), "--seeds", "1150,1151", "--grid-steps-gradient", "1",
+              "--grid-steps-neighbourhood", "1", "--grid-rev-lam", "1", "--slo-margin", "100", "--duration", "4",
+              "--procs", "1", "--label", "smoke"]
+    try:
+        res2 = tune.main(common + ["--out", str(out2), "--config-out", str(cfg2), "--raw", str(raw2),
+                                   "--from-raw", str(raw), "--background-factor", "9"])
+        assert (tune.GATE_P95_MS, tune.GATE_MAX_MS) == (450.0, 4500.0)
+        assert [r["vs_base"] for r in res2["rows"]] == [r["vs_base"] for r in res["rows"]]
+        assert "re-selected from" in out2.read_text() and "9x the official" in out2.read_text()
+        with pytest.raises(SystemExit):                   # a different grid than the raw file's
+            tune.main(common[:5] + ["2"] + common[6:] + ["--out", str(tmp_path / "r3.md"), "--config-out",
+                      str(tmp_path / "c3.json"), "--from-raw", str(raw)])
+    finally:
+        tune.set_background_factor(tune.DEFAULTS_BACKGROUND_FACTOR)
 
 
 def test_missing_step_a_config_refuses(tmp_path):
