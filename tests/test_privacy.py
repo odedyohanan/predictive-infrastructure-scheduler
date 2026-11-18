@@ -58,3 +58,12 @@ def test_check_privacy_does_not_skip_undecodable_files(tmp_path):
     (tmp_path / "bin.txt").write_bytes(b"\xff\xfe junk " + (HOME_PREFIX + "someone/x").encode())
     subprocess.run(["git", "add", "bin.txt"], cwd=tmp_path, check=True)
     assert _run(tmp_path) == 1
+
+
+def test_safe_path_hides_absolute_paths():
+    from pis.privacy import safe_path
+    assert safe_path("data/counterfactual_v1") == "data/counterfactual_v1"
+    assert safe_path("worldmodel:data/adaptive_v1") == "worldmodel:data/adaptive_v1"
+    out = safe_path(HOME_PREFIX + "someone/x/cf_timing")
+    assert out == "<abs>/cf_timing" and HOME_PREFIX not in out
+    assert safe_path("/tmp/a/b.pt") == "<abs>/b.pt"

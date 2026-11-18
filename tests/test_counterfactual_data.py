@@ -71,3 +71,15 @@ def test_context_records_only_provide_history(records):
     want = encode_input(encode_state(ctx["input"]["telemetry"]), ctx["applied"], ctx["input"]["known"])
     i = next(j for j, r in enumerate(kept) if r is records[first] or r == records[first])
     np.testing.assert_array_equal(H[i, -2], want)
+
+
+def test_run_configs_contain_no_absolute_paths():
+    from tests._load import load_script
+    manifest = load_script("make_counterfactual_data").manifest
+    recipe = load_script("train_world_model").recipe
+    home = "/" + "Users" + "/someone/x"
+    m = manifest({"out": home + "/cf", "seeds": [1150]})
+    assert home not in json.dumps(m) and m["out"] == "<abs>/cf"
+    r = recipe({"out": home + "/m.pt", "data": "x"}, [home + "/cf", "worldmodel:data/adaptive_v1"])
+    assert home not in json.dumps(r)
+    assert r["data"] == ["<abs>/cf", "worldmodel:data/adaptive_v1"] and r["out"] == "<abs>/m.pt"

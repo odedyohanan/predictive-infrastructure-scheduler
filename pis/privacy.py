@@ -25,3 +25,12 @@ def scrub(text: str) -> str:
             text = text.replace(literal, "<path>")
     text = _HOME_RE.sub("<path>", text)
     return _EMAIL.sub("<email>", text)
+
+
+def safe_path(p: str) -> str:
+    """A path fit for a recorded config: relative or prefixed ('worldmodel:x') paths stay as they are;
+    an absolute path is reduced to '<abs>/<last component>'."""
+    p = str(p)
+    if Path(p).is_absolute() or re.match(r"^[A-Za-z]:\\", p):
+        return "<abs>/" + Path(p.replace("\\", "/")).name
+    return scrub(p)

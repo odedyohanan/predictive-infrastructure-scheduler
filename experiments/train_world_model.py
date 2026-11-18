@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pis.config import resolve, setup_imports  # noqa: E402
 from pis.counterfactual import history_arrays_without_context, read_records  # noqa: E402
-from pis.privacy import scrub  # noqa: E402
+from pis.privacy import safe_path, scrub  # noqa: E402
 
 setup_imports()
 
@@ -31,6 +31,12 @@ from worldmodel.train import train_model  # noqa: E402
 
 DEFAULT_DATA = ("worldmodel:data/adaptive_v1,old_data:teacher_v2,old_data:dagger_r1,"
                 "local:data/counterfactual_v1")
+
+
+def recipe(args: dict, refs: list[str]) -> dict:
+    """Training config as stored in the checkpoint meta and recipe file; no absolute paths."""
+    return {**args, "data": [safe_path(r) for r in refs], "out": safe_path(args["out"]),
+            "trainer": "worldmodel.train.train_model", "context_rows_dropped": True}
 
 
 def main():
@@ -73,20 +79,19 @@ def main():
                               seed=a.seed, hidden=a.hidden, layers=a.layers, log=log,
                               arch=a.arch, history=a.history)
     lo, hi = state_bounds(tr_recs)
-    recipe = {**vars(a), "data": refs, "trainer": "worldmodel.train.train_model",
-              "context_rows_dropped": True}
-    model.meta.update({"args": recipe, "state_names": STATE_NAMES, "input_names": INPUT_NAMES,
+    rec = recipe(vars(a), refs)
+    model.meta.update({"args": rec, "state_names": STATE_NAMES, "input_names": INPUT_NAMES,
                        "n_train": len(tr[0]), "n_val": len(va[0]),
-                       "state_min": lo.tolist(), "state_max": hi.tolist(), "bounds_from": refs})
+                       "state_min": lo.tolist(), "state_max": hi.tolist(), "bounds_from": rec["data"]})
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     model.save(out)
     sha = hashlib.sha256(out.read_bytes()).hexdigest()
     out.with_suffix(".history.json").write_text(json.dumps(hist))
     out.with_suffix(".recipe.json").write_text(scrub(json.dumps(
-        {**recipe, "best_val_loss": model.meta["best_val_loss"], "epochs_run": len(hist),
+        {**rec, "best_val_loss": model.meta["best_val_loss"], "epochs_run": len(hist),
          "sha256": sha, "seconds": round(time.time() - t0)}, indent=1)))
-    print(f"best val loss {model.meta['best_val_loss']:.4f} after {len(hist)} epochs -> {a.out} "
+    print(f"best val loss {model.meta['best_val_loss']:.4f} after {len(hist)} epochs -> {safe_path(a.out)} "
           f"(sha256 {sha})")
 
 
