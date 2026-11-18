@@ -9,3 +9,6 @@ data/
 runs/
 logs/
 *.pt
+.env
+*.local
+results/raw/
