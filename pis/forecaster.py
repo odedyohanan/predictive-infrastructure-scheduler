@@ -1,7 +1,8 @@
 """Batched open-loop GRU rollouts: many candidate policies, one forward pass per step.
 
 History format: `list[(telemetry, policy)]`, newest last. Every older pair is a real recorded
-window and the policy that was applied to it. The newest pair carries the current telemetry; its
+window t and the policy applied in the window after t (what the sibling's build_arrays calls
+"applied"). The newest pair carries the current telemetry; its
 policy slot is replaced by each candidate (held fixed for the whole horizon), so only the telemetry
 of the newest pair is used. Conventions follow `worldmodel.rollout` / `worldmodel.history`.
 """
@@ -34,16 +35,16 @@ def rollout_batch(model: WorldModel, history: list[tuple[dict, dict]], policies:
     # Real rows before the newest window; a short history is padded with its first row.
     real = [encode_input(encode_state(t), p, known) for t, p in history[:-1]][-(k - 1):] if k > 1 else []
     s0 = encode_state(history[-1][0])
-    if k > 1 and not real:
-        real = [encode_input(s0, policies[0], known)]      # no past at all: copy of the first input
-    while len(real) < k - 1:
+    while real and len(real) < k - 1:
         real.insert(0, real[0])
     n = len(policies)
-    past = np.broadcast_to(np.stack(real), (n, k - 1, len(real[0]))).copy() if k > 1 else None
+    past = np.broadcast_to(np.stack(real), (n, k - 1, len(real[0]))).copy() if real else None
     s = np.tile(s0, (n, 1))
     out = np.empty((n, horizon, s0.shape[0]), dtype=np.float32)
     for t in range(horizon):
         x = np.stack([encode_input(s[i], policies[i], known) for i in range(n)])      # [n, n_in]
+        if past is None and k > 1:      # no past at all: each candidate pads with its own first input
+            past = np.repeat(x[:, None], k - 1, axis=1)
         hist = x[:, None] if past is None else np.concatenate([past, x[:, None]], axis=1)
         s = clip_state(model.predict_next(model.prepare(hist), s))
         if bounds is not None:
