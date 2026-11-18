@@ -260,16 +260,25 @@ def timing_available(timing: dict | None) -> bool:
     return timing is not None and "unavailable" not in timing
 
 
-def success(per: dict, arm: str, rule: dict, timing: dict | None) -> dict:
+def success(per: dict, arm: str, rule: dict, timing: dict | None, seeds: list[int] | None = None) -> dict:
     """The protocol's success rule for one candidate arm against the reference. `timing` is the normal-priority
-    verdict, or None / {"unavailable": reason} when it cannot be used (part (c) is then not met)."""
+    verdict, or None / {"unavailable": reason} when it cannot be used (part (c) is then not met). The rule is
+    decidable only when the candidate and the reference both have a successful run for every seed (`seeds`;
+    default: every seed either arm recorded); otherwise `met` is False and `undecidable` gives the reason, while
+    the paired statistics on the available seeds are still returned."""
     v = paired(per, arm, rule["reference"], "value_per_s", rule["confidence"])
     s = paired(per, arm, rule["reference"], "slo_v2_pct", rule["confidence"])
     value_ok = bool(v["n"] >= 2 and v["mean"] > 0 and v["lo"] > 0)
     slo_ok = bool(s["n"] >= 2 and s["hi"] <= rule["slo_v2_margin_pp"])
     time_ok = bool(timing["p95_ok"] and timing["max_ok"]) if timing_available(timing) else None
+    want = sorted(seeds) if seeds is not None else sorted(set(per.get(arm, {})) | set(per.get(rule["reference"], {})))
+    n_cand, n_ref = (sum(1 for x in want if x in per.get(a, {})) for a in (arm, rule["reference"]))
+    undecidable = None
+    if n_cand < len(want) or n_ref < len(want):
+        undecidable = (f"not decidable: {arm} has {n_cand} and {rule['reference']} {n_ref} successful runs of "
+                       f"{len(want)} scenarios")
     return {"value": v, "slo_v2": s, "value_ok": value_ok, "slo_ok": slo_ok, "time_ok": time_ok,
-            "met": bool(value_ok and slo_ok and time_ok is True)}
+            "undecidable": undecidable, "met": bool(value_ok and slo_ok and time_ok is True and not undecidable)}
 
 
 def _f(x, nd=1) -> str:
@@ -340,7 +349,7 @@ def report(raw: list[dict], protocol: dict | None = None, meta: dict | None = No
         if arm not in arms:
             continue
         t = timing.get(arm)
-        sv = success(per, arm, rule, t)
+        sv = success(per, arm, rule, t, seeds)
         verdicts[arm] = sv
         if t is None:
             tt = "not available"
@@ -351,7 +360,7 @@ def report(raw: list[dict], protocol: dict | None = None, meta: dict | None = No
                   f"{t['worst_max']:.1f} ms; {t['source']})")
         L.append(f"| {arm} | {_ci(sv['value'])} {'met' if sv['value_ok'] else 'not met'} | "
                  f"{_ci(sv['slo_v2'], 2)} {'met' if sv['slo_ok'] else 'not met'} | {tt} | {sv['value']['n']} | "
-                 f"**{'yes' if sv['met'] else 'no'}** |")
+                 f"**{'not decidable' if sv['undecidable'] else 'yes' if sv['met'] else 'no'}** |")
     short = []
     for arm, sv in verdicts.items():
         if sv["value"]["n"] < len(seeds):
@@ -361,6 +370,10 @@ def report(raw: list[dict], protocol: dict | None = None, meta: dict | None = No
     if short:
         L += ["", "**Warning: the rule was evaluated on fewer scenarios than the protocol's** - " + "; ".join(short)
               + ". Failed runs are not replaced; see Runs."]
+    for arm, sv in verdicts.items():
+        if sv["undecidable"]:
+            L += ["", f"**{arm}: {sv['undecidable']}; the success rule is not decidable for it.** The paired "
+                  "statistics above use the scenarios where both arms succeeded."]
     any_met = [a for a, v in verdicts.items() if v["met"]]
     L += ["", ("**Success: " + ", ".join(any_met) + " met the rule.**") if any_met else
           "**No candidate arm met the success rule.** The result is reported as it is.",

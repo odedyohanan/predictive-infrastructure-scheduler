@@ -82,6 +82,22 @@ def test_success_rule():
     assert not runner.success(runner.per_arm(worse), "loop_a", rule, good)["value_ok"]
 
 
+def test_success_needs_complete_runs():
+    rule = {"reference": "base_r6", "confidence": 0.95, "slo_v2_margin_pp": 1.0}
+    good = {"worst_p95": 10.0, "worst_max": 100.0, "p95_ok": True, "max_ok": True, "source": "x"}
+    raw = [_ok("base_r6", s, 100.0 + s, slo2=1.0) for s in range(10)]
+    raw += [_ok("loop_a", s, 105.0 + s + (s % 3) * 0.1, slo2=1.0) for s in range(7)]
+    per = runner.per_arm(raw)
+    s = runner.success(per, "loop_a", rule, good, seeds=list(range(10)))
+    assert not s["met"] and s["value"]["n"] == 7 and "not decidable" in s["undecidable"]
+    assert s["value_ok"] and s["slo_ok"]                                 # paired stats still reported
+    ref_short = runner.per_arm([r for r in raw if not (r["arm"] == "base_r6" and r["seed"] == 9)])
+    assert not runner.success(ref_short, "loop_a", rule, good, seeds=list(range(7)) + [9])["met"]
+    assert runner.success(per, "loop_a", rule, good, seeds=list(range(7)))["met"]
+    text = runner.report(raw, fe.make_protocol(), timing={"loop_a": good}, seeds=list(range(10)))
+    assert "not decidable" in text and "met the rule" not in text
+
+
 def test_spearman():
     assert runner.spearman([1, 2, 3, 4], [10, 20, 30, 40]) == pytest.approx(1.0)
     assert runner.spearman([1, 2, 3, 4], [4, 3, 2, 1]) == pytest.approx(-1.0)
@@ -163,6 +179,8 @@ def test_official_guards():
         assert any(path in e for e in _check(_args(), _state(committed=c)))
     assert _check(_args(out="elsewhere/report.md"))
     assert _check(_args(raw_dir="elsewhere/raw"))
+    assert _check(_args(raw_dir=fe.OFFICIAL_RAW + "/alt"))              # exact paths, not subdirectories
+    assert _check(_args(out="results/final/other/report.md"))
     assert _check(_args(), _state(raw_exists=True))
     assert _check(_args(), _state(report_text="# x\n\n## Attempt 1\n"))
     assert _check(_args(attempt=2))                                     # no attempt 1 yet
@@ -376,3 +394,24 @@ def test_crashed_attempt_leaves_its_section_and_is_summarised_by_the_next(tmp_pa
     second = (tmp_path / "r2.md").read_text()
     assert "## Attempt 2 (rehearsal)" in second and "(started)" not in second
     assert "previous attempt: attempt 1: 2 of 9 runs recorded (2 ok, 0 failed), did not complete" in second
+
+
+def test_attempts_are_pinned_to_the_previous_configuration():
+    prev = {"protocol": {"sha256": "p" * 64},
+            "step_configs": {"step_a": {"sha256": "a" * 64}, "step_b": {"sha256": "b" * 64}},
+            "models_sha256": {"member m1": "1" * 64, "base_r6 x": "2" * 64}}
+    assert fe.pinned_mismatch(prev, prev) == []
+    cur = json.loads(json.dumps(prev))
+    cur["step_configs"]["step_b"]["sha256"] = "c" * 64
+    cur["models_sha256"]["member m1"] = "3" * 64
+    cur["code"] = "git HEAD other"                                         # a code fix is allowed
+    bad = fe.pinned_mismatch(prev, cur)
+    assert len(bad) == 2 and any("step_b" in b for b in bad) and any("member m1" in b for b in bad)
+    assert fe.pinned_mismatch({}, prev)                                    # nothing recorded: refuse
+    assert fe.pinned_mismatch(None, prev)
+
+
+def test_official_timing_checked_before_start(tmp_path):
+    steps = {"step_a": {"members": ["m"], "params": {}}, "step_b": {"members": ["m"], "reviser": {}}}
+    bad = fe.timing_refusals(steps, {"m": "a" * 64}, lambda path: False)
+    assert len(bad) == 2 and all("unavailable" in b or "missing" in b for b in bad)
