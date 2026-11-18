@@ -40,3 +40,12 @@ def test_setup_imports_error_does_not_echo_absolute_env_path(monkeypatch):
         config.setup_imports()
     assert absolute not in str(e.value)
     assert "SCHED_REPO" in str(e.value)
+
+
+def test_resolve_prefixes(monkeypatch):
+    monkeypatch.setenv("WORLDMODEL_REPO", "wm")
+    monkeypatch.setenv("OLD_DATA", "old")
+    assert str(config.resolve("worldmodel:models/x.pt")) == "wm/models/x.pt"
+    assert str(config.resolve("old_data:teacher_v2")) == "old/teacher_v2"
+    assert str(config.resolve("local:models/y.pt")) == "models/y.pt"
+    assert str(config.resolve("data/z")) == "data/z"

@@ -141,3 +141,28 @@ def test_pairs_below_noise_floor_are_excluded():
     out = summarise([rec], ["m"], horizons=(1,))["m"]["h1"]
     assert out["n_resolvable_pairs"] == 2
     assert out["pairwise_sign_acc"] == 1.0
+
+
+def _summary(rho, pw, iv_acc, n_states=300, n_cases=150):
+    def h1(r, p, a):
+        return {"median_spearman": r, "spearman_resolvable": [r] * n_states, "n_resolvable_states": n_states,
+                "pairwise_sign_acc": p,
+                "interventions": {i: {"sign_acc": a, "n_cases": n_cases} for i in INTERVENTIONS}}
+    return {"model": {"h1": h1(rho, pw, iv_acc)}, "action_blind": {"h1": h1(0.0, 0.0, 0.0)},
+            "persistence": {"h1": h1(0.0, 0.0, 0.0)}}
+
+
+@pytest.mark.parametrize("args,verdict", [
+    ((0.6, 0.8, 0.8), "PASS"),
+    ((0.45, 0.8, 0.8), "FAIL"),
+    ((0.6, 0.65, 0.8), "FAIL"),
+    ((0.6, 0.8, 0.6), "FAIL"),
+])
+def test_gate_thresholds(args, verdict):
+    from pis.probe import gate
+    assert gate(_summary(*args), [])["verdict"] == verdict
+
+
+def test_gate_inconclusive_without_enough_states():
+    from pis.probe import gate
+    assert gate(_summary(0.9, 0.9, 0.9, n_states=100), [])["verdict"] == "INCONCLUSIVE"
