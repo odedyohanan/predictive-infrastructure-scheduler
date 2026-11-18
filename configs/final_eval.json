@@ -1,0 +1,160 @@
+{
+ "name": "final paired evaluation",
+ "seeds": {
+  "first": 2000,
+  "last": 2099
+ },
+ "duration_s": 60.0,
+ "scenario": "spec = random_spec(default_rng(900000 + seed)); Simulator(spec, seed, duration_s); one decision per 500 ms window; every arm starts from the same isolated policy",
+ "reference_arm": "base_r6",
+ "arms": {
+  "base_r6": {
+   "kind": "base",
+   "checkpoint": "models/rl_r6/final.pt",
+   "sha256": "ca02c87cf70d40a735b698cb5561c20b2816864349de33bf04d6824c0c2247fd",
+   "role": "reference: the base scheduler as delivered, greedy"
+  },
+  "base_r3": {
+   "kind": "base",
+   "checkpoint": "models/rl_r3/final.pt",
+   "sha256": "e0cb957b8dc293defbdc5cbe043f02f8b60069c267b239d07a3cb28b3892ed21",
+   "role": "earlier RL scheduler, greedy (reference point)"
+  },
+  "loop_a": {
+   "kind": "loop",
+   "config": "configs/step_a.json",
+   "options": {},
+   "role": "candidate: Step A loop, members and Params from the Step A config"
+  },
+  "loop_b": {
+   "kind": "reviser",
+   "config": "configs/step_b.json",
+   "role": "candidate: Step B loop, members, Step A Params and reviser from the Step B config"
+  },
+  "random_selection": {
+   "kind": "loop",
+   "config": "configs/step_a.json",
+   "options": {
+    "selection": "random"
+   },
+   "role": "ablation, lower bound: uniform choice among the same candidates"
+  },
+  "oracle_selection": {
+   "kind": "loop",
+   "config": "configs/step_a.json",
+   "options": {
+    "selection": "oracle"
+   },
+   "role": "ablation, upper bound: candidates ranked by the real simulator"
+  },
+  "loop_no_uncertainty": {
+   "kind": "loop",
+   "config": "configs/step_a.json",
+   "options": {
+    "use_uncertainty": false
+   },
+   "role": "ablation: Step A without the disagreement penalty"
+  },
+  "loop_no_fallback": {
+   "kind": "loop",
+   "config": "configs/step_a.json",
+   "options": {
+    "use_fallback": false
+   },
+   "role": "ablation: Step A without the trust gate and fallback"
+  },
+  "adaptive_c9": {
+   "kind": "adaptive",
+   "h0": 2.0,
+   "r_hi": 0.6,
+   "hold": 6,
+   "role": "non-ML feedback baseline, configuration 9 of the sibling's adaptive grid"
+  }
+ },
+ "metrics": {
+  "primary": "value_per_s: (B batches x value + C core-ms x value) per second, as the RL reward",
+  "per_scenario": [
+   "value_per_s",
+   "slo_v2_pct",
+   "slo_v1_pct",
+   "a_late_pct",
+   "a_queue_overdue_end",
+   "policy_changes",
+   "decide_ms_mean",
+   "decide_ms_p95",
+   "decide_ms_max",
+   "fallback_rate",
+   "gru_error",
+   "rank_agreement",
+   "top1_agreement"
+  ],
+  "slo": "window-violation % of A's p99 SLO; v2 (sees queued requests) is primary, v1 reported",
+  "run_time_model_probe": "arms that rank with the ensemble: every probe_every-th model decision, every candidate run for H windows in a copy of the real simulator after the decision is timed; GRU error = mean |ensemble-mean forecast - real| on the disagreement keys in training-std units; rank agreement = Spearman of predicted vs real reward over candidates",
+  "probe_every": 5
+ },
+ "success_rule": {
+  "candidates": [
+   "loop_a",
+   "loop_b"
+  ],
+  "reference": "base_r6",
+  "confidence": 0.95,
+  "value": "paired 95% CI of (candidate - base_r6) value_per_s lies above zero",
+  "slo_v2_margin_pp": 1.0,
+  "slo": "paired upper 95% bound of (candidate - base_r6) slo_v2_pct <= +1.0 percentage point",
+  "decision_time": "worst per-scenario p95 <= 50 ms and max <= 500 ms at normal priority, from experiments/time_decisions.py (results/step_a/timing.md, results/step_b/timing.md); decision time measured in this run is under background QoS and reported only",
+  "pairs": "per scenario, over the scenarios where both arms succeeded; Student-t CI",
+  "otherwise": "any other result is reported as it is; a CI including zero is no detectable difference"
+ },
+ "decision_time_ms": {
+  "p95_target": 50.0,
+  "hard_limit": 500.0
+ },
+ "secondary": [
+  {
+   "a": "loop_a",
+   "b": "random_selection",
+   "why": "value of the model's ranking"
+  },
+  {
+   "a": "oracle_selection",
+   "b": "loop_a",
+   "why": "headroom left in the candidate set"
+  },
+  {
+   "a": "loop_b",
+   "b": "loop_a",
+   "why": "value of revision"
+  },
+  {
+   "a": "loop_a",
+   "b": "loop_no_uncertainty",
+   "why": "value of the uncertainty penalty"
+  },
+  {
+   "a": "loop_a",
+   "b": "loop_no_fallback",
+   "why": "value of the trust gate and fallback"
+  },
+  {
+   "a": "base_r6",
+   "b": "base_r3",
+   "why": "R6 vs R3 reference"
+  },
+  {
+   "a": "loop_a",
+   "b": "adaptive_c9",
+   "why": "Step A vs non-ML feedback"
+  },
+  {
+   "a": "loop_b",
+   "b": "adaptive_c9",
+   "why": "Step B vs non-ML feedback"
+  }
+ ],
+ "failure_handling": "a run that raises is recorded with a scrubbed message and listed, never dropped or replaced; comparisons use the scenarios where both arms succeeded. A crash or a bug: fix, rerun as the next attempt, report every attempt; no tuning on these results.",
+ "outputs": {
+  "report": "results/final/report.md",
+  "raw": "results/raw/final/attempt<N>/"
+ }
+}
