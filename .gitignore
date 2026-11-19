@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+.claude/
+# large generated artifacts
+data/
+runs/
+logs/
+*.pt
+.env
+*.local
+results/raw/
+models/
