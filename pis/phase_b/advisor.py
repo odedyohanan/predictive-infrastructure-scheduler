@@ -45,6 +45,7 @@ from pis.candidates import is_valid, policy_key
 from pis.config import setup_imports
 from pis.evaluator import change_penalty, predicted_rewards
 from pis.phase_b import features, incidents
+from pis.phase_b.incidents import onset_share
 from pis.phase_b.scenarios import mask_policy
 from pis.probe import named_interventions
 
@@ -126,29 +127,6 @@ def choose_candidate(mean_value: np.ndarray, cvar_value: np.ndarray, p_incident:
     best = mv[ok].max()
     tied = np.flatnonzero(ok & (mv >= best - tie))
     return int(tied[np.argmax(cv[tied])])          # argmax keeps the lowest index among equal CVaRs
-
-
-def onset_share(observed: np.ndarray, future: np.ndarray, rule: incidents.IncidentRule, horizon: int,
-                warmup: int = incidents.WARMUP) -> float:
-    """Share of the futures (rows of `future` [R, m], violation flags) with a new counted onset in
-    (t, t + horizon], t = the last observed window, judged on the observed violations joined with each.
-
-    Only the last interval + k + 1 observed windows can change the verdict (runs and the trailing majority
-    look back that far at most), so the series is cut there; the warm-up is shifted with the cut.
-    """
-    v0 = np.asarray(observed, dtype=bool)
-    fut = np.asarray(future, dtype=bool)
-    if not len(fut):
-        return float("nan")
-    cut = max(len(v0) - (rule.interval + rule.k + 1), 0)
-    v0 = v0[cut:]
-    t, wu = len(v0) - 1, max(warmup - cut, 0)
-    idle = np.zeros(len(v0) + fut.shape[1], dtype=bool)
-    hits = 0
-    for row in fut:
-        lab = incidents.label_series(np.concatenate([v0, row]), idle, rule, wu)
-        hits += incidents.onset_within(lab, t, horizon)
-    return hits / len(fut)
 
 
 # ------------------------------------------------------------------ history kept by the advisor

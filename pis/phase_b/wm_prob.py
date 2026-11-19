@@ -336,23 +336,20 @@ def rollout_risk(model, window: features.Window, rows: pd.DataFrame, rule: incid
     """Share of `n` sampled futures in which a new counted incident starts in (t, t + horizon].
 
     `rows` are the observed rows up to the current window t (columns `slo_v2_violation`, optionally
-    `window` and `deg_active`); `window` their encoding. The policy in force (the newest row's) is held
+    `window`); `window` their encoding. The policy in force (the newest row's) is held
     unless `policy` is given. Futures run `horizon + k - 1` windows (a run starting at t + horizon needs k
     windows) and their windows are never "degradation active"; onsets are judged on the observed series
-    joined with each future, as the Monte Carlo labels judge real branches.
+    joined with each future, as the Monte Carlo labels judge real branches (`incidents.onset_share`, the
+    advisor's judgement too).
     """
-    from pis.phase_b.mc_labels import branch_windows, new_onset
+    from pis.phase_b.mc_labels import branch_windows
     pol = window.policies[-1] if policy is None else policy
     m = branch_windows(horizon, rule)
     roll = model.sample_rollouts(window, pol, known, m, n, seed=seed)
     pv = features.predicted_violation(features.decode(roll))
     v0 = rows["slo_v2_violation"].to_numpy(dtype=bool)
-    a0 = rows["deg_active"].to_numpy(dtype=bool) if "deg_active" in rows else np.zeros(len(rows), bool)
     w0 = int(rows["window"].iloc[0]) if "window" in rows and len(rows) else 0
-    t, wu, idle = len(rows) - 1, max(warmup - w0, 0), np.zeros(m, dtype=bool)
-    hits = sum(new_onset(np.concatenate([v0, pv[i]]), np.concatenate([a0, idle]), rule, t, horizon, wu)
-               for i in range(n))
-    return hits / n
+    return incidents.onset_share(v0, pv[:n], rule, horizon, max(warmup - w0, 0))
 
 
 # ------------------------------------------------------------------ calibration
@@ -489,7 +486,7 @@ def intervention_agreement(model, seeds, n_states: int = 50, reseeds: int = 8, h
     (masked for the CPUs and GPUs lost at that time, as the simulator masks it).
     """
     from pis.candidates import policy_key
-    from pis.phase_b.mc_labels import continue_branch, replay_visit
+    from pis.phase_b.mc_labels import continue_branch, policy_in_force, replay_visit
     from pis.phase_b.scenarios import mask_policy
     from pis.probe import named_interventions
     from pis.runner import spearman
@@ -517,7 +514,7 @@ def intervention_agreement(model, seeds, n_states: int = 50, reseeds: int = 8, h
                 pred_c[key] = float(features.decode(roll[:, -1])[:, j].mean())
             return true_c[key], pred_c[key]
 
-        for name, (before, after) in named_interventions(st.records[-1]["policy"]).items():
+        for name, (before, after) in named_interventions(policy_in_force(st)).items():
             (tb, pb), (ta, pa) = outcome(before), outcome(after)
             effects.append({"episode": st.seed, "window": st.t, "intervention": name,
                             "true": ta - tb, "pred": pa - pb})

@@ -327,3 +327,54 @@ def test_script_refuses_smoke_options_in_real_runs():
 def test_sample_states_refuses_too_many():
     with pytest.raises(ValueError):
         mc_labels.sample_states(_episodes()[:1], n=1000, horizon=20, warmup=20)
+
+
+def test_policy_in_force_is_the_one_decided_after_the_previous_window():
+    from pis.adapters import initial_policy
+    from pis.phase_b import mc_labels
+    st = type("S", (), {})()
+    st.t, st.records = 0, [{"policy": {"p": 1}}]
+    assert mc_labels.policy_in_force(st) == initial_policy()
+    st.t, st.records = 2, [{"policy": {"p": 0}}, {"policy": {"p": 1}}, {"policy": {"p": 2}}]
+    assert mc_labels.policy_in_force(st) == {"p": 1}
+
+
+def test_mc_projection_uses_the_branch_length():
+    import pandas as pd
+    script = load_script("b_mc_labels")
+    df = pd.DataFrame({"risk": [0.0, 0.5], "branch_windows": [100, 100], "branch_s": [1.0, 1.0],
+                       "replay_s": [0.0, 0.0]})
+    out = script.summarize(df, horizon=20, k=7, full_states=10, full_branches=2)
+    assert out["projected_full_s_one_proc"] == pytest.approx(10 * 2 * (20 + 7 - 1) * 0.01)
+
+
+def _label_shard(tmp_path, monkeypatch, tamper):
+    from pis.phase_b.history import Store
+    from pis.shards import Shard
+    if tamper:
+        orig = Store.window_rows
+
+        def window_rows(self, episode, start, end):
+            rows = orig(self, episode, start, end)
+            rows.loc[rows.index[10], "a_queue_overdue"] += 1
+            return rows
+        monkeypatch.setattr(Store, "window_rows", window_rows)
+    params = {"k": 2, "interval": 8, "majority": 0.5, "warmup": 20, "horizon": 2, "branches": 1,
+              "method": "plain", "store": str(PROBE)}
+    d = tmp_path / "s0000"
+    d.mkdir(parents=True)
+    script.run_shard(Shard("s0000", [[3104, 24, "uniform"], [3104, 26, "uniform"]]), d, params)
+    return d
+
+
+@pytest.mark.skipif(not PROBE.is_dir(), reason="stored probe episodes not available")
+def test_labels_check_the_replay_against_the_store(tmp_path, monkeypatch):
+    import json
+    import pandas as pd
+    d = _label_shard(tmp_path / "ok", monkeypatch, tamper=False)
+    assert len(pd.read_parquet(d / script.LABELS_FILE)) == 2
+    assert json.loads((d / script.REFUSED_FILE).read_text()) == []
+    d = _label_shard(tmp_path / "bad", monkeypatch, tamper=True)
+    assert len(pd.read_parquet(d / script.LABELS_FILE)) == 0
+    (ref,) = json.loads((d / script.REFUSED_FILE).read_text())
+    assert ref["episode"] == 3104 and ref["window"] == 24 and "a_queue_overdue" in ref["reason"]

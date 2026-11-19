@@ -124,3 +124,26 @@ def early_signal(records: list[dict], w: int = 4) -> np.ndarray:
 def onset_within(labels: Labels, t: int, h: int) -> bool:
     """A counted incident starts in windows (t, t + h]: the prediction target."""
     return any(t < inc.onset <= t + h for inc in labels.incidents)
+
+
+def onset_share(observed: np.ndarray, future: np.ndarray, rule: IncidentRule, horizon: int,
+                warmup: int = WARMUP) -> float:
+    """Share of the futures (rows of `future` [R, m], violation flags) with a new counted onset in
+    (t, t + horizon], t = the last observed window, judged on the observed violations joined with each.
+
+    Only the last interval + k + 1 observed windows can change the verdict (runs and the trailing majority
+    look back that far at most), so the series is cut there; the warm-up is shifted with the cut.
+    """
+    v0 = np.asarray(observed, dtype=bool)
+    fut = np.asarray(future, dtype=bool)
+    if not len(fut):
+        return float("nan")
+    cut = max(len(v0) - (rule.interval + rule.k + 1), 0)
+    v0 = v0[cut:]
+    t, wu = len(v0) - 1, max(warmup - cut, 0)
+    idle = np.zeros(len(v0) + fut.shape[1], dtype=bool)
+    hits = 0
+    for row in fut:
+        lab = label_series(np.concatenate([v0, row]), idle, rule, wu)
+        hits += onset_within(lab, t, horizon)
+    return hits / len(fut)

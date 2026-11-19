@@ -92,7 +92,6 @@ def horizon_for(lead: int) -> int:
 def run_shard(shard, shard_dir: Path, params: dict) -> None:
     import torch
     torch.set_num_threads(1)
-    from pis.adapters import initial_policy
     from pis.candidates import policy_key
     from pis.phase_b import mc_labels
     from pis.probe import named_interventions
@@ -102,7 +101,7 @@ def run_shard(shard, shard_dir: Path, params: dict) -> None:
         t0 = time.time()
         st = mc_labels.replay_to(int(seed), int(t))
         replay_s = time.time() - t0
-        current = st.records[-2]["policy"] if t > 0 else initial_policy()
+        current = mc_labels.policy_in_force(st)
         arms = {name: after for name, (_, after) in named_interventions(current).items()
                 if policy_key(after) != policy_key(current)}
         reseeds = [LEAD_TAG + int(seed) * 1000 + j for j in range(n)]

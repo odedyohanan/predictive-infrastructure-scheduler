@@ -397,3 +397,50 @@ def test_script_needs_incident_config(tmp_path, monkeypatch):
     monkeypatch.setattr(runs, "tree_dirty", lambda ignore=(): False)
     with pytest.raises(SystemExit, match="incident"):
         script.main(["--seeds", "3100-3101", "--incident", str(tmp_path / "missing.json")])
+
+
+def test_rollout_risk_uses_the_shared_onset_share_and_equals_full_series_judgement():
+    from pis.phase_b import incidents
+    from pis.phase_b.mc_labels import new_onset
+    assert wm_prob.rollout_risk.__globals__.get("onset_share") is incidents.onset_share or \
+        "onset_share" in wm_prob.rollout_risk.__code__.co_names
+    rng = np.random.default_rng(5)
+    rule = IncidentRule(k=3, interval=12)
+
+    class Random:
+        context = 4
+
+        def __init__(self, flags):
+            self.flags = flags
+
+        def sample_rollouts(self, hist, policy, known, horizon, n, seed=None):
+            out = np.zeros((n, horizon, 43), np.float32)
+            out[..., 41] = np.log1p(1000)
+            out[..., 40] = np.where(self.flags[:n, :horizon], np.log1p(500), 0.0)
+            return out
+
+    for trial in range(20):
+        w, horizon, n = int(rng.integers(25, 60)), int(rng.integers(2, 8)), 6
+        w0 = int(rng.integers(0, 15))                      # rows may start after window 0
+        viol = rng.random(w) < 0.35
+        rows = pd.DataFrame({"window": np.arange(w0, w0 + w), "slo_v2_violation": viol,
+                             "deg_active": np.zeros(w, bool)})
+        flags = rng.random((n, horizon + rule.k - 1)) < 0.4
+        risk = wm_prob.rollout_risk(Random(flags), _window(w), rows, rule, horizon=horizon, n=n, warmup=20)
+        wu = max(20 - w0, 0)
+        want = np.mean([new_onset(np.concatenate([viol, f]), np.zeros(w + len(f), bool), rule, w - 1, horizon, wu)
+                        for f in flags])
+        assert risk == pytest.approx(want), trial
+
+
+def test_rank_agreement_uses_the_policy_in_force(monkeypatch):
+    import pis.probe
+    from pis.phase_b import mc_labels
+    seen = []
+    monkeypatch.setattr(wm_prob, "_rank_states", lambda *a, **kw: {3450: [25]})
+    monkeypatch.setattr(pis.probe, "named_interventions", lambda p: seen.append(p) or {})
+    model = _tiny_model(context=4, room=64)
+    out = wm_prob.intervention_agreement(model, [3450], n_states=1, reseeds=1, horizon=2, n=2)
+    assert out["effects"] == 0
+    st = mc_labels.state_at(scenarios.scenario_for(3450), 25)
+    assert seen == [st.records[-2]["policy"]]

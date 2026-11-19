@@ -114,6 +114,13 @@ def state_at(scenario: Scenario, t: int) -> State:
     return out[0]
 
 
+def policy_in_force(state: State) -> dict:
+    """The policy that ran during window t: the one decided after window t - 1 (the start policy at t = 0).
+    `state.records[-1]["policy"]` is the decision after window t, in force from t + 1."""
+    from pis.adapters import initial_policy
+    return state.records[-2]["policy"] if state.t > 0 else initial_policy()
+
+
 def replay_visit(seed: int, ts, visit: Callable[[State], None]) -> None:
     check_replayable(seed)
     run_to(scenario_for(seed), ts, visit)

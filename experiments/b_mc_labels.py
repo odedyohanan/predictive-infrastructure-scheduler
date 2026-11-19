@@ -19,6 +19,7 @@ and write only into `--smoke-dir`. Long runs go through scripts/gentle.sh.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from functools import partial
@@ -27,6 +28,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+import numpy as np  # noqa: E402
 
 from pis.phase_b import runs  # noqa: E402
 from pis.phase_b import seeds as seed_ranges  # noqa: E402
@@ -40,6 +43,7 @@ ZERO_SHARE_FOR_RESTART = 0.8
 LEVEL_QUANTILES = (0.5, 0.8, 0.95)   # of positive overdue backlogs: the splitting levels
 RESTART = {"n_roots": 16, "split": 2, "max_paths": 128}
 LABELS_FILE = "labels.parquet"
+REFUSED_FILE = "refused.json"
 
 
 def check_seeds(seeds: list[int], smoke: bool) -> None:
@@ -54,9 +58,12 @@ def run_shard(shard, shard_dir: Path, params: dict) -> None:
     import torch
     torch.set_num_threads(1)
     from pis.phase_b import incidents, mc_labels
+    from pis.phase_b.history import Store
     rule = incidents.IncidentRule(params["k"], params["interval"], params["majority"])
     h, warmup = params["horizon"], params["warmup"]
+    store = Store(params["store"])
     rows: list[dict] = []
+    refused: list[dict] = []
     by_ep: dict[int, list] = {}
     for ep, w, stratum in shard.items:
         by_ep.setdefault(int(ep), []).append((int(w), stratum))
@@ -65,7 +72,12 @@ def run_shard(shard, shard_dir: Path, params: dict) -> None:
         t_rep = time.time()
         clock = {"branch_s": 0.0}
 
-        def visit(state, ep=ep, stratum_of=stratum_of, clock=clock):
+        stored = store.window_rows(ep, 0, max(stratum_of) + 1)
+
+        def visit(state, ep=ep, stratum_of=stratum_of, clock=clock, stored=stored):
+            why = replay_mismatch(state.records, stored)
+            if why:
+                raise _Refused(*why)
             t0 = time.time()
             if params["method"] == "plain":
                 risk = mc_labels.branch_risk(state, rule, h, params["branches"],
@@ -85,12 +97,42 @@ def run_shard(shard, shard_dir: Path, params: dict) -> None:
                          # upper bound for splitting: copies start part-way through the branch
                          "branch_windows": int(n) * mc_labels.branch_windows(h, rule), "branch_s": dt})
 
-        mc_labels.replay_visit(ep, list(stratum_of), visit)
+        try:
+            mc_labels.replay_visit(ep, list(stratum_of), visit)
+        except _Refused as e:                       # the whole episode is left out, and recorded
+            rows = [r for r in rows if r["episode"] != ep]
+            refused.append({"episode": ep, "window": int(e.args[1]), "reason": e.args[0]})
+            continue
         replay_s = time.time() - t_rep - clock["branch_s"]
         for r in rows:
             if r["episode"] == ep:
                 r["replay_s"] = replay_s / len(items)
-    pd.DataFrame(rows).to_parquet(shard_dir / LABELS_FILE, index=False)
+    cols = ["episode", "window", "risk", "n", "method", "stratum", "kind", "in_incident", "branch_windows",
+            "branch_s", "replay_s"]
+    pd.DataFrame(rows, columns=cols).to_parquet(shard_dir / LABELS_FILE, index=False)
+    (shard_dir / REFUSED_FILE).write_text(json.dumps(refused, indent=1))
+
+
+class _Refused(Exception):
+    """A replay that does not reproduce the stored episode: (reason, window)."""
+
+
+def replay_mismatch(records: list[dict], stored) -> tuple[str, int] | None:
+    """(reason, window) when the replayed violation or a_queue_overdue series up to the last record differ
+    from the stored rows of the same windows; None when they agree."""
+    from pis.phase_b import incidents
+    n = len(records)
+    if len(stored) < n:
+        return ("the store has fewer windows than the replay", n - 1)
+    viol = incidents.violations(records)
+    want_v = stored["slo_v2_violation"].to_numpy(bool)[:n]
+    q = np.array([r["tel"]["a"]["queue_overdue"] for r in records], dtype=np.int64)
+    want_q = stored["a_queue_overdue"].to_numpy(np.int64)[:n]
+    for name, a, b in (("slo_v2_violation", viol, want_v), ("a_queue_overdue", q, want_q)):
+        bad = np.flatnonzero(a != b)
+        if len(bad):
+            return (f"replayed {name} differs from the store at window {int(bad[0])}", n - 1)
+    return None
 
 
 # Label columns: episode, window (t), risk, n (branches, or paths for splitting), method, stratum, kind,
@@ -102,6 +144,17 @@ def make_shards(states):
     from pis.shards import Shard
     return [Shard(f"s{i // SHARD_SIZE:04d}", [list(s) for s in states[i:i + SHARD_SIZE]])
             for i in range(0, len(states), SHARD_SIZE)]
+
+
+def collect_refused(out: Path) -> list[dict]:
+    """Episodes whose replay did not reproduce the store (left out of the labels), over finished shards."""
+    from pis.shards import collect
+    return [r for d in collect(out) if (d / REFUSED_FILE).is_file() for r in json.loads((d / REFUSED_FILE).read_text())]
+
+
+def expected_states(states, refused) -> int:
+    gone = {int(r["episode"]) for r in refused}
+    return sum(int(s[0]) not in gone for s in states)
 
 
 def collect_labels(out: Path):
@@ -144,13 +197,14 @@ def overdue_levels(store, seeds: list[int]) -> list[int]:
 
 
 # ------------------------------------------------------------------ report
-def summarize(df, horizon: int, full_states: int = 1200, full_branches: int = 32) -> dict:
-    """Label statistics and timing; the projection is for `full_states` x `full_branches` at `horizon`."""
+def summarize(df, horizon: int, k: int = 1, full_states: int = 1200, full_branches: int = 32) -> dict:
+    """Label statistics and timing; the projection is for `full_states` x `full_branches` branches of
+    horizon + k - 1 windows (`mc_labels.branch_windows`)."""
     zero = float((df.risk == 0).mean())
     bw = float(df.branch_windows.sum())
     per_bw = float(df.branch_s.sum()) / bw if bw else float("nan")
     per_replay_state = float(df.replay_s.mean())
-    full_s = full_states * (full_branches * horizon * per_bw + per_replay_state)
+    full_s = full_states * (full_branches * (horizon + k - 1) * per_bw + per_replay_state)
     return {"states": len(df), "zero_share": zero, "mean_risk": float(df.risk.mean()),
             "s_per_branch_window": per_bw, "replay_s_per_state": per_replay_state,
             "projected_full_s_one_proc": full_s}
@@ -182,6 +236,11 @@ def note_text(cfg: dict, plain: dict, chosen: str, final, restart: dict | None, 
               "|---|---|---|---|---|"]
     for (s, k), g in final.groupby(["stratum", "kind"]):
         lines.append(f"| {s} | {k} | {len(g)} | {g.risk.mean():.3f} | {(g.risk == 0).mean():.0%} |")
+    refused = cfg.get("refused") or []
+    lines += ["", "## Replay check", "",
+              "Before a state is labelled, the replayed violation and a_queue_overdue series up to it must equal the "
+              f"stored rows; an episode that differs is left out. Refused episodes: {len(refused)}."]
+    lines += [f"- episode {r['episode']} (at window {r['window']}): {r['reason']}" for r in refused]
     return "\n".join(lines) + "\n"
 
 
@@ -243,7 +302,7 @@ def main(argv=None) -> dict:
     print(f"{len(states)} states from {len(eps)} episodes, {len(shards)} shards, {a.procs} processes", flush=True)
     method = "restart" if a.method == "restart" else "plain"
     try:
-        res = run_shards(out, shards, partial(run_shard, params={**cfg, "method": "plain"}),
+        res = run_shards(out, shards, partial(run_shard, params={**cfg, "method": "plain", "store": str(a.store)}),
                          {**cfg, "method": "plain"}, a.procs) if method == "plain" else None
     except ValueError as e:
         raise SystemExit(f"refusing to run: {e}")
@@ -252,9 +311,9 @@ def main(argv=None) -> dict:
     if method == "plain":
         print(f"plain: done {len(res['done'])}, skipped {len(res['skipped'])}, failed {res['failed']} "
               f"in {time.time() - t0:.0f} s", flush=True)
-        if plain_df is None or len(plain_df) != len(states):
+        if plain_df is None or len(plain_df) != expected_states(states, collect_refused(out)):
             raise SystemExit("unfinished shards: rerun the same command")
-        plain = summarize(plain_df, horizon)
+        plain = summarize(plain_df, horizon, rule.k)
         if a.method == "auto" and plain["zero_share"] > ZERO_SHARE_FOR_RESTART:
             method = "restart"
     final = plain_df
@@ -262,14 +321,18 @@ def main(argv=None) -> dict:
         levels = overdue_levels(store, sorted({s[0] for s in states}))
         rcfg = {**cfg, "method": "restart", "levels": levels, "restart": RESTART}
         cfg["levels"] = levels
-        rres = run_shards(out / "restart", shards, partial(run_shard, params=rcfg), rcfg, a.procs)
+        rres = run_shards(out / "restart", shards, partial(run_shard, params={**rcfg, "store": str(a.store)}),
+                          rcfg, a.procs)
         final = collect_labels(out / "restart")
-        if final is None or len(final) != len(states):
+        if final is None or len(final) != expected_states(states, collect_refused(out / "restart")):
             raise SystemExit(f"unfinished restart shards {rres['failed']}: rerun the same command")
-        restart_sum = summarize(final, horizon)
+        restart_sum = summarize(final, horizon, rule.k)
         if plain_df is None:
             plain_df, plain = final, restart_sum
     final.to_parquet(out / LABELS_FILE, index=False)
+    cfg["refused"] = collect_refused(out / "restart" if method == "restart" else out)
+    for r in cfg["refused"]:
+        print(f"refused episode {r['episode']}: {r['reason']}", flush=True)
     runs.write_note(note, note_text(cfg, plain, method, final, restart_sum, a.method != "auto"))
     print(f"labels: {len(final)} states, method {method}; risk 0 in {(final.risk == 0).mean():.1%}", flush=True)
     print(f"timing: {plain['s_per_branch_window'] * 1000:.1f} ms per branch-window, "
