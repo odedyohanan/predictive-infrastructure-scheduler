@@ -5,7 +5,8 @@
       --smoke-dir data/phase_b/smoke_<name>
 
 The quiet minutes of ordinary (no degradation) R6 history episodes set the run length: after the warm-up,
-each episode is cut into 1-minute blocks (120 windows, a partial last block is dropped) and `k` is the
+each episode is cut into 1-minute blocks (120 windows, a partial last block is dropped; a run belongs to
+the block it starts in) and `k` is the
 smallest k >= 2 such that at most 5 % of blocks hold a violation run of length >= k; `interval` = 4k. With
 fewer than 20 such episodes, ordinary R6-with-interventions episodes are added (recorded in the note).
 With that rule every history episode is labelled: incidents per degradation kind, building-up vs sudden,
@@ -46,20 +47,24 @@ RULE_KEYS = ("k", "interval", "majority", "warmup", "chronic")
 
 
 def block_run_lengths(viol, warmup: int = WARMUP, block: int = BLOCK) -> list[list[int]]:
-    """Lengths of the violation runs inside each full block after the warm-up (runs cut at block edges)."""
-    v = np.asarray(viol, dtype=bool)[warmup:]
-    out = []
-    for b in range(len(v) // block):
-        runs_, n = [], 0
-        for x in v[b * block:(b + 1) * block]:
-            if x:
-                n += 1
-            elif n:
-                runs_.append(n)
-                n = 0
-        if n:
-            runs_.append(n)
-        out.append(runs_)
+    """Lengths of the violation runs per full block after the warm-up. A run belongs, whole, to the block it
+    starts in (as an incident run would be judged); runs starting in the warm-up or in the partial last
+    block are dropped."""
+    v = np.asarray(viol, dtype=bool)
+    n_blocks = (len(v) - warmup) // block
+    out: list[list[int]] = [[] for _ in range(max(n_blocks, 0))]
+    i = 0
+    while i < len(v):
+        if not v[i]:
+            i += 1
+            continue
+        j = i
+        while j < len(v) and v[j]:
+            j += 1
+        b = (i - warmup) // block
+        if i >= warmup and b < n_blocks:
+            out[b].append(j - i)
+        i = j
     return out
 
 

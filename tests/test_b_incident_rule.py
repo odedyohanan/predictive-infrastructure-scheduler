@@ -32,12 +32,13 @@ def test_block_run_lengths_after_warmup_full_blocks_only():
     viol = np.zeros(20 + 120 * 2 + 50, dtype=bool)
     viol[5:15] = True                    # warm-up: ignored
     viol[20 + 10:20 + 13] = True         # block 0: run 3
-    viol[20 + 118:20 + 123] = True       # crosses blocks 0/1: 2 in block 0, 3 in block 1
+    viol[20 + 118:20 + 123] = True       # starts in block 0, crosses into block 1: one run of 5 in block 0
     viol[20 + 240:20 + 280] = True       # partial block: dropped
+    viol[18:24] = True                   # starts in the warm-up: not counted
     out = rule.block_run_lengths(viol, warmup=20, block=120)
     assert len(out) == 2
-    assert sorted(out[0]) == [2, 3]
-    assert out[1] == [3]
+    assert sorted(out[0]) == [3, 5]
+    assert out[1] == []
 
 
 def test_rule_config_keys():
@@ -58,21 +59,24 @@ def test_effect_window_first_significant_negative():
     diffs = np.tile([1.0, -1.0, 2.0, -2.0, 0.5, -0.5, 3.0, -3.0], (40, 1))   # mean 0: CI holds 0
     diffs[12:] -= 10.0                   # from window index 12 the intervention clearly lowers overdue
     assert lead.effect_window(diffs) == 13       # 1-based: windows after the intervention starts
+    assert lead.effect_window(diffs, persist=1) == 13
 
 
 def test_effect_window_single_noisy_window_counts():
-    # the rule takes the first significant window as it is: one chance hit is enough
+    # one chance significant window is not an effect by default (3 consecutive windows are needed)
     diffs = np.zeros((10, 8))
     diffs[2] = [-1.0, -1.1, -0.9, -1.0, -1.2, -0.8, -1.0, -1.0]
-    assert lead.effect_window(diffs) == 3
-    assert lead.effect_window(diffs, persist=2) is None
+    assert lead.effect_window(diffs) is None
+    assert lead.effect_window(diffs, persist=1) == 3
 
 
 def test_effect_window_persistence():
     diffs = np.zeros((10, 8))
     diffs[2] = -1.0
     diffs[5:] = -1.0
-    assert lead.effect_window(diffs, persist=3) == 6
+    assert lead.effect_window(diffs) == 6
+    diffs[7:] = 0.0                      # significant in 5, 6 only
+    assert lead.effect_window(diffs) is None
 
 
 def test_effect_window_none_when_no_effect():

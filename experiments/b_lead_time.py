@@ -10,7 +10,8 @@ the early signal (slope of A's overdue backlog) has been positive for 3 windows;
 per episode, in seed order. At each state every named intervention whose "after" policy differs from the
 policy in force is held for the horizon, against R6 continuing, with paired reseeds
 (13_000_000 + seed*1000 + j) on the real simulator. The effect window of an intervention is the first
-window where the paired 95 % CI of A's overdue backlog (intervention - R6) lies entirely below zero; a
+window of 3 consecutive windows where the paired 95 % CI of A's overdue backlog (intervention - R6) lies
+entirely below zero (one chance significant window among 40 is not an effect); a
 state's effect window is the earliest over its interventions (states without any effect are reported, not
 used). min_lead_windows = median over states, rounded up; H = max(20, 2 * min_lead_windows). Both are
 added to configs/phase_b/incident.json; note results/phase_b/lead_time.md. Shards of 5 states.
@@ -43,6 +44,7 @@ MAX_STATES = 40
 RESEEDS = 8
 HORIZON = 40
 RISING = 3                  # windows of positive early signal
+PERSIST = 3                 # consecutive significant windows that make an effect
 SHARD_SIZE = 5
 MIN_H = 20
 RESULT_FILE = "states.json"
@@ -62,7 +64,7 @@ def lead_state(q, warmup: int, last: int) -> int | None:
     return None
 
 
-def effect_window(diffs, persist: int = 1) -> int | None:
+def effect_window(diffs, persist: int = PERSIST) -> int | None:
     """First window (1-based, counted from the intervention's first window) whose paired 95 % CI of
     `diffs[w, j]` (intervention - R6, reseed j) lies entirely below zero, and stays so for `persist`
     consecutive windows; None if there is none."""
@@ -146,7 +148,8 @@ def note_text(cfg: dict, results: list[dict], lead: int | None, h: int | None) -
              f"States: {len(results)} (first window with a rising overdue backlog for {RISING} windows, one per "
              f"episode, {cfg['episodes']} R6 episodes of seeds {cfg['seeds'][0]}-{cfg['seeds'][-1]}). "
              f"Interventions held for {cfg['horizon']} windows vs R6 continuing, {cfg['reseeds']} paired reseeds; "
-             "effect = first window whose paired 95 % CI of A's overdue backlog (intervention - R6) is below 0.",
+             f"effect = first of {PERSIST} consecutive windows whose paired 95 % CI of A's overdue backlog "
+             "(intervention - R6) is below 0.",
              "", "| episode | window | " + " | ".join(cfg["interventions"]) + " | earliest |",
              "|---|---|" + "---|" * (len(cfg["interventions"]) + 1)]
     for r in sorted(results, key=lambda r: r["episode"]):
