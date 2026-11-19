@@ -91,10 +91,18 @@ def test_quiet_episode_alarm_rate():
     sm = alarms.summarize(scores)
     assert sm["quiet_episodes"] == 2
     assert sm["alarms_per_quiet_episode"] == pytest.approx(1.0)
+    assert sm["judged_alarms_per_quiet_episode"] == pytest.approx(1.0)
     assert sm["false_alarm_rate"] == pytest.approx(2 / 3)
     assert sm["by_cause"]["building_up"]["recall"] == 1.0
     assert sm["by_cause"]["sudden"]["recall"] is None
     assert alarms.episode_loss(scores[1]) == 0.0
+
+
+def test_quiet_episode_censored_events_reported_apart():
+    quiet = _labels(100, [])
+    sm = alarms.summarize([alarms.score_episode([10, 95], quiet, 20, 1)])      # 95 + 20 > 99: censored
+    assert sm["alarms_per_quiet_episode"] == pytest.approx(2.0)
+    assert sm["judged_alarms_per_quiet_episode"] == pytest.approx(1.0)
 
 
 def test_summary_without_events_or_quiet_episodes():
@@ -102,6 +110,7 @@ def test_summary_without_events_or_quiet_episodes():
     sm = alarms.summarize([alarms.score_episode([], busy, 20, 1)])
     assert sm["false_alarm_rate"] is None
     assert sm["alarms_per_quiet_episode"] is None
+    assert sm["judged_alarms_per_quiet_episode"] is None
     assert sm["by_cause"]["building_up"]["recall"] == 0.0
     assert sm["by_cause"]["building_up"]["median_lead"] is None
     assert alarms.summarize([])["events"] == 0
@@ -295,6 +304,13 @@ def test_shadow_end_to_end(shadow, tmp_path):
                               else "GATE: stop before prevention")
     note = (tmp_path / "note.md").read_text()
     assert "GATE:" in note
+    for n in shadow.ALL:                                           # Brier states counted per predictor
+        b = res["predictors"][n]["selection"]["brier"]
+        row = next(line for line in note.splitlines() if line.startswith(f"| {n} |") and "/" in line
+                   and "(n " in line)
+        assert f"(n {b['all']['n']}/{b['building_up']['n']}/{b['sudden']['n']})" in row
+    assert "CALIBRATION" in note and "monotone" in note           # queueing scale and threshold share seeds
+    assert "censored" in note and "judged" in note
     assert res["ms_per_window"] > 0
     assert "brier" in res["predictors"]["hazard"]["selection"]
     again = shadow.shadow(**args)                                  # finished shards are reused

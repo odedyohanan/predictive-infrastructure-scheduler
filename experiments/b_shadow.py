@@ -20,7 +20,8 @@ Scoring (`pis.phase_b.alarms`): per predictor a conformal threshold on the calib
 share <= alpha = 0.10, `low` = 0.7 x threshold); on the selection episodes recall of incidents caught with a
 lead >= min_lead_windows, median lead, pooled false-alarm rate, alarm events per quiet episode and the Brier
 score of the window risk against the Monte Carlo labels, split by cause (a labelled state is "building_up"
-when a degradation is active at it). Question 1: each learned predictor's building-up recall minus that of
+when a degradation is active at it). All bootstrap intervals use one shared resample stream (same tag, same
+selection episodes): common random numbers across predictors and causes. Question 1: each learned predictor's building-up recall minus that of
 the better non-learned one, with a 95 % bootstrap interval over selection episodes. The predictor with the
 best building-up recall (ties: lower false-alarm rate) goes to the alarms config; the note ends with the
 gate: recall <= 0.2 stops before prevention.
@@ -265,6 +266,9 @@ def note_text(cfg: dict, res: dict, q1: dict, best: str | None, gate_line: tuple
              "per-episode false-alarm share on the calibration episodes, alpha = 0.10. An alarm event is false "
              "when no new incident starts within H after it; events whose H windows run past the episode end "
              "are not judged.", "",
+             "The queueing model's scale and the conformal thresholds are both set on the CALIBRATION episodes. "
+             "The scale is a monotone map of the queueing statistic, so the alarm-on threshold selects the same "
+             "windows whatever the scale; only `low` (0.7 x threshold, in risk units) depends on it.", "",
              "## Thresholds (calibration)", "",
              "| predictor | threshold | low | adjusted risk | false-alarm rate | events |", "|---|---|---|---|---|---|"]
     for n, v in res.items():
@@ -274,17 +278,22 @@ def note_text(cfg: dict, res: dict, q1: dict, best: str | None, gate_line: tuple
                      f"{_f(c['false_alarm_rate'])} | {c['events']} |")
     lines += ["", "## Selection episodes", "",
               "| predictor | recall building-up | recall sudden | median lead bu / sudden | false-alarm rate | "
-              "alarms per quiet episode | Brier all / bu / sudden |", "|---|---|---|---|---|---|---|"]
+              "alarms per quiet episode all / judged | Brier all / bu / sudden (n states) |",
+              "|---|---|---|---|---|---|---|"]
     for n, v in res.items():
         s, b = v["selection"], v["selection"]["by_cause"]
         rec = [f"{_f(b[c]['recall'], '{:.2f}')} ({b[c]['caught']}/{b[c]['incidents']})" for c in b]
-        br = " / ".join(_f(s["brier"][c]["brier"]) for c in ("all", "building_up", "sudden"))
+        cs = ("all", "building_up", "sudden")
+        br = " / ".join(_f(s["brier"][c]["brier"]) for c in cs) + \
+            " (n " + "/".join(str(s["brier"][c]["n"]) for c in cs) + ")"
         lines.append(f"| {n} | {rec[0]} | {rec[1]} | {_f(b['building_up']['median_lead'], '{:.1f}')} / "
                      f"{_f(b['sudden']['median_lead'], '{:.1f}')} | {_f(s['false_alarm_rate'])} | "
-                     f"{_f(s['alarms_per_quiet_episode'], '{:.2f}')} | {br} |")
-    nb = {c: next(iter(res.values()))["selection"]["brier"][c]["n"] for c in ("all", "building_up", "sudden")} \
-        if res else {}
-    lines += ["", f"Brier states (Monte Carlo labels on selection): {nb}. Quiet episode = no counted incident.",
+                     f"{_f(s['alarms_per_quiet_episode'], '{:.2f}')} / "
+                     f"{_f(s.get('judged_alarms_per_quiet_episode'), '{:.2f}')} | {br} |")
+    lines += ["", "Brier: Monte Carlo labelled selection states with a finite risk of that predictor (n states "
+              "per predictor: all / building-up / sudden). Quiet episode = no counted incident. Alarms per quiet "
+              "episode: \"all\" includes the censored events near the episode's end (neither true nor false), "
+              "\"judged\" counts only the true and false ones.",
               "", "## Question 1: learned vs not learned", "",
               f"Better non-learned predictor (selection building-up recall): {q1.get('non_ml') or '-'}. "
               "Difference of recall (lead >= min lead), 95 % bootstrap interval over selection episodes "

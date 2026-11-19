@@ -91,7 +91,10 @@ def episode_loss(score: dict) -> float:
 
 
 def summarize(scores: list[dict]) -> dict:
-    """Pooled statistics over episodes. Quiet episode = no counted incident. Undefined ratios are None."""
+    """Pooled statistics over episodes. Quiet episode = no counted incident. Undefined ratios are None.
+
+    `alarms_per_quiet_episode` counts every alarm event of the quiet episodes, the censored ones near the
+    episode's end included; `judged_alarms_per_quiet_episode` counts only the judged ones (true or false)."""
     tot = {k: sum(s[k] for s in scores) for k in ("events", "true", "false", "censored")}
     judged = tot["true"] + tot["false"]
     quiet = [s for s in scores if not sum(s["incidents"].values())]
@@ -105,6 +108,8 @@ def summarize(scores: list[dict]) -> dict:
     return {**tot, "episodes": len(scores), "false_alarm_rate": tot["false"] / judged if judged else None,
             "quiet_episodes": len(quiet),
             "alarms_per_quiet_episode": sum(s["events"] for s in quiet) / len(quiet) if quiet else None,
+            "judged_alarms_per_quiet_episode": (sum(s["true"] + s["false"] for s in quiet) / len(quiet)
+                                                if quiet else None),
             "by_cause": by}
 
 
@@ -141,7 +146,11 @@ def conformal_threshold(per_episode_scores, alpha: float = ALPHA, *, H: int, tai
 def bootstrap_recall_diff(caught_a, caught_b, incidents_n, reps: int = BOOT_REPS, tag: int = BOOT_TAG,
                           conf: float = 0.95) -> dict:
     """Recall of A minus recall of B over the incidents of resampled episodes (per-episode counts), with a
-    percentile interval. Resamples without any incident are skipped."""
+    percentile interval. Resamples without any incident are skipped.
+
+    The resample indices depend only on `tag`, `reps` and the number of episodes, so every comparison made
+    with the default tag over the same episodes (all predictors, both causes) uses one shared stream of
+    resamples: common random numbers, the intervals are directly comparable but not independent."""
     a, b, n = (np.asarray(x, dtype=float) for x in (caught_a, caught_b, incidents_n))
     if not n.sum():
         return {"diff": None, "lo": None, "hi": None, "reps": 0}
