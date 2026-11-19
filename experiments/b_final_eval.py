@@ -240,8 +240,8 @@ def make_protocol(paths: dict | None = None, root: Path = ROOT) -> dict:
         "candidate": "advisor", "reference": REFERENCE, "confidence": CONF,
         "time_in_incident": "paired 95% CI upper bound of (advisor - r6) time_in_incident_s over the episodes "
                             "that are not chronic for r6 is below zero",
-        "value": "paired 95% lower bound of (advisor - r6) value_per_s over all episodes >= -value_tol x r6's "
-                 "mean value_per_s over the same episodes",
+        "value": "paired 95% lower bound of (advisor - r6) value_per_s over all episodes >= -value_tol x |r6's "
+                 "mean value_per_s| over the same episodes (absolute value of the mean)",
         "value_tol": VALUE_TOL,
         "decision_time": "worst per-episode p95 <= decide_p95_ms and max <= decide_max_ms at normal priority, "
                          "from the timing note (unlabelled, the advisor config's params, the alarms config, the "
@@ -288,6 +288,9 @@ def make_protocol(paths: dict | None = None, root: Path = ROOT) -> dict:
                                    "better non-learned predictor; the bootstrap 95% interval over episodes lies "
                                    "above zero",
                            "bootstrap": {"reps": alarm_mod.BOOT_REPS, "tag": alarm_mod.BOOT_TAG, "conf": CONF}},
+            "not_decidable": "question 2 is not decidable (never a success) when any r6 or advisor run of the "
+                             "attempt failed; question 1 is not decidable when any r6 run or its predictor "
+                             "scoring failed (those episodes are excluded and counted)",
             "otherwise": "any other result is reported as it is; an interval including zero is no detectable "
                          "difference"},
         "failure_handling": "a run that raises is recorded with a scrubbed message and listed, never dropped or "
@@ -309,6 +312,10 @@ def validate_protocol(p: dict) -> list[str]:
         errors.append(f"protocol arms {list(p['arms'])} differ from {list(want)}")
     if p["reference_arm"] != REFERENCE:
         errors.append("the reference arm must be r6")
+    if protocol_seeds(p) != list(seed_ranges.HELD_OUT):
+        errors.append("the protocol's seeds are not the held-out range 3000-3099")
+    if p["duration_s"] != DURATION_S:
+        errors.append(f"the protocol's duration is not {DURATION_S:g} s")
     q2 = p["success_rule"].get("question_2")
     if (p["variant"] == "shadow_only") != (q2 == "not attempted"):
         errors.append("question 2 is attempted exactly when the variant is full")
@@ -594,18 +601,24 @@ def run_shard(shard, shard_dir: Path, params: dict) -> None:
                     ctl = policies.make(arm, sc.spec, seed)
                 recs = run_episode(sc, ctl, arm)
                 rec = episode_record(recs, sc.spec, inc, seed, arm, time.perf_counter() - t0)
-                if arm == REFERENCE:
-                    rows = features.rows_from_records(recs, known_params(sc.spec), episode=seed)
-                    t1 = time.perf_counter()
-                    risk = shadow.episode_risks(preds, names, rows, int(rule["H"]), int(rule["warmup"]), seed)
-                    rec["scoring_s"] = time.perf_counter() - t1
-                    rows_all.append(rows)
-                    risk_frames.append(pd.DataFrame({"episode": np.full(len(rows), seed, dtype=np.int64),
-                                                     "window": np.arange(len(rows), dtype=np.int64), **risk}))
             except Exception as e:                      # recorded and listed, never replaced
                 tb = traceback.format_exc(limit=3)
                 rec = {"seed": seed, "arm": arm, "failed": scrub(f"{type(e).__name__}: {e}"),
                        "traceback": scrub(tb), "seconds": time.perf_counter() - t0}
+            if arm == REFERENCE and not rec["failed"]:
+                # scoring has its own failure record: a predictor that raises never fails the R6 run
+                t1 = time.perf_counter()
+                rec["scoring_failed"] = None
+                try:
+                    rows = features.rows_from_records(recs, known_params(sc.spec), episode=seed)
+                    risk = shadow.episode_risks(preds, names, rows, int(rule["H"]), int(rule["warmup"]), seed)
+                    rows_all.append(rows)
+                    risk_frames.append(pd.DataFrame({"episode": np.full(len(rows), seed, dtype=np.int64),
+                                                     "window": np.arange(len(rows), dtype=np.int64), **risk}))
+                except Exception as e:
+                    rec["scoring_failed"] = scrub(f"{type(e).__name__}: {e}")
+                    rec["scoring_traceback"] = scrub(traceback.format_exc(limit=3))
+                rec["scoring_s"] = time.perf_counter() - t1
             out.append(rec)
     (shard_dir / EPISODES_FILE).write_text(json.dumps(out, indent=1, allow_nan=False))
     if rows_all:
@@ -676,7 +689,7 @@ def question_two(episodes: list[dict], arms, rule, timing: dict | None) -> dict:
     if isinstance(rule, dict) and rule.get("candidate") in out:
         a = out[rule["candidate"]]
         hi, lo = a["time_diff"]["hi"], a["value_diff"]["lo"]
-        bound = -float(rule["value_tol"]) * a["r6_value"]
+        bound = -float(rule["value_tol"]) * abs(a["r6_value"])
         time_ok = bool(math.isfinite(hi) and hi < 0)
         value_ok = bool(math.isfinite(lo) and math.isfinite(bound) and lo >= bound)
         if timing is None or "unavailable" in timing:
@@ -686,9 +699,14 @@ def question_two(episodes: list[dict], arms, rule, timing: dict | None) -> dict:
                              and timing["worst_max"] <= rule["decide_max_ms"])
             ttext = (f"worst p95 {timing['worst_p95']:.1f} ms (limit {rule['decide_p95_ms']:g}), worst max "
                      f"{timing['worst_max']:.1f} ms (limit {rule['decide_max_ms']:g})")
+        blocking = [f for f in failed if f[1] in (REFERENCE, rule["candidate"])]
+        decidable = not blocking
         success = {"time_ok": time_ok, "value_ok": value_ok, "timing_ok": timing_ok, "timing": ttext,
-                   "value_bound": bound, "met": time_ok and value_ok and timing_ok}
-    return {"reference": ref, "arms": out, "success": success, "failed": failed}
+                   "value_bound": bound, "decidable": decidable, "blocking": blocking,
+                   "met": decidable and time_ok and value_ok and timing_ok}
+    scoring_failed = sorted((e["seed"], e["scoring_failed"]) for e in episodes
+                            if e["arm"] == REFERENCE and not e.get("failed") and e.get("scoring_failed"))
+    return {"reference": ref, "arms": out, "success": success, "failed": failed, "scoring_failed": scoring_failed}
 
 
 # ------------------------------------------------------------------ question 1
@@ -717,15 +735,22 @@ def outcome_brier(risks: dict, labels: dict, active: dict, names, episodes, rule
     return out
 
 
-def question_one(risks: dict, labels: dict, active: dict, names, calibration, held_out, rule: dict) -> dict:
-    """The shadow run's scoring with thresholds from the calibration episodes, applied to the held-out ones."""
+def question_one(risks: dict, labels: dict, active: dict, names, calibration, held_out, rule: dict,
+                 blocking=()) -> dict:
+    """The shadow run's scoring with thresholds from the calibration episodes, applied to the held-out ones.
+    `blocking`: failed R6 runs or scorings of the attempt (seed, what, message); any makes Q1 not decidable."""
+    shared = set(map(int, calibration)) & set(map(int, held_out))
+    if shared:
+        raise ValueError(f"held-out and calibration episodes overlap: {sorted(shared)[:5]}")
     shadow = runs.load_script("b_shadow")
     names = [n for n in shadow.ALL if n in names]
     res = shadow.evaluate(risks, labels, active, names, list(calibration), list(held_out), rule, None)
     q1 = shadow.question_one(res)
     verdict = {n: (None if d["building_up"]["lo"] is None else bool(d["building_up"]["lo"] > 0))
                for n, d in q1["diffs"].items()}
-    return {"predictors": res, "q1": q1, "verdict": verdict,
+    blocking = list(blocking)
+    return {"predictors": res, "q1": q1, "verdict": verdict, "decidable": not blocking, "blocking": blocking,
+            "above_zero": sorted(n for n, v in verdict.items() if v),
             "outcome_brier": outcome_brier(risks, labels, active, names, list(held_out), rule)}
 
 
@@ -785,10 +810,16 @@ def report_text(protocol: dict, meta: dict, q2: dict, q1: dict, timing: dict | N
             L += [f"- (a) time in incident: upper bound {_f(a['time_diff']['hi'], '{:+.2f}')} s < 0: "
                   f"{'met' if s['time_ok'] else 'not met'}",
                   f"- (b) value per second: lower bound {_f(a['value_diff']['lo'], '{:+.3f}')} >= "
-                  f"{_f(s['value_bound'], '{:+.3f}')} (-{rule['value_tol']:.0%} of R6's mean): "
+                  f"{_f(s['value_bound'], '{:+.3f}')} (-{rule['value_tol']:.0%} of |R6's mean|): "
                   f"{'met' if s['value_ok'] else 'not met'}",
                   f"- (c) decision time at normal priority: {s['timing']}: {'met' if s['timing_ok'] else 'not met'}",
-                  "", f"**Question 2: {'SUCCESS' if s['met'] else 'not met'}**"]
+                  ""]
+            if not s["decidable"]:
+                L += [f"{len(s['blocking'])} {rule['reference']} or {rule['candidate']} run(s) failed in this "
+                      "attempt: by the protocol the verdict is not decidable (never a success).", "",
+                      "**Question 2: not decidable**"]
+            else:
+                L.append(f"**Question 2: {'SUCCESS' if s['met'] else 'not met'}**")
     L += ["", "### Question 1: learned vs not learned predictors on the held-out R6 episodes", "",
           "Thresholds: conformal, from the shadow run's calibration episodes (never refitted here). Recall at lead "
           ">= min lead; Brier of the window risk against the realised outcome (new counted onset within H).", "",
@@ -811,6 +842,20 @@ def report_text(protocol: dict, meta: dict, q2: dict, q1: dict, timing: dict | N
                  for c in CAUSES]
         v = q1["verdict"].get(n)
         L.append(f"| {n} | {cells[0]} | {cells[1]} | {'-' if v is None else 'yes' if v else 'no'} |")
+    L.append("")
+    if not q1.get("decidable", True):
+        L += [f"{len(q1['blocking'])} R6 run(s) or their predictor scoring failed in this attempt; those episodes "
+              "are excluded above and by the protocol the verdict is not decidable.", "",
+              "**Question 1: not decidable**"]
+    elif q1.get("above_zero"):
+        L.append(f"**Question 1: learned predictor(s) above the better non-learned one: "
+                 f"{', '.join(q1['above_zero'])}**")
+    else:
+        L.append("**Question 1: no learned predictor above the better non-learned one**")
+    scoring = q2.get("scoring_failed", [])
+    if scoring:
+        L += ["", "### Failed predictor scoring (R6 run kept, episode excluded from question 1)", ""]
+        L += [f"- seed {s}: {msg}" for s, msg in scoring]
     if q2["failed"]:
         L += ["", "### Failed runs", ""] + [f"- seed {s}, {arm}: {msg}" for s, arm, msg in q2["failed"]]
     if warnings:
@@ -963,6 +1008,9 @@ def main(argv=None):
         config.setdefault("resumed_utc", []).append(now)
     else:
         import torch
+        contiguous = seeds == list(range(seeds[0], seeds[-1] + 1))
+        seed_text = (str(seeds[0]) if len(seeds) == 1 else f"{seeds[0]}-{seeds[-1]}") if contiguous \
+            else ",".join(map(str, seeds))
         freeze = state["freeze"]["commits"][-1] if state["freeze"]["commits"] and \
             _abs(a.protocol).resolve() == _abs(PROTOCOL).resolve() else None
         config = {"attempt": a.attempt, "label": a.label, "official": official, "head": head,
@@ -970,8 +1018,7 @@ def main(argv=None):
                   "protocol": {"path": safe_path(a.protocol), "sha256": pinned["protocol_sha256"],
                                "freeze_commit": freeze, "variant": protocol["variant"]},
                   "pinned": pinned, "arms": arms, "n_seeds": len(seeds),
-                  "seeds": (str(seeds[0]) if len(seeds) == 1 else f"{seeds[0]}-{seeds[-1]}")
-                  if seeds == list(range(seeds[0], seeds[-1] + 1)) else ",".join(map(str, seeds)), "duration_s": duration, "procs": a.procs, "priority": a.priority,
+                  "seeds": seed_text, "duration_s": duration, "procs": a.procs, "priority": a.priority,
                   "versions": {"python": platform.python_version(), "numpy": np.__version__,
                                "torch": torch.__version__},
                   "start_utc": now}
@@ -1034,6 +1081,9 @@ def main(argv=None):
     risks, labels, active = dict(cal_risks), dict(cal_labels), dict(cal_active)
     rule_ = incidents.IncidentRule(int(rule["k"]), int(rule["interval"]), float(rule["majority"]))
     scored = []
+    shared = set(map(int, calibration)) & {int(e["seed"]) for e in episodes}
+    if shared:
+        raise SystemExit(f"held-out and calibration episodes overlap: {sorted(shared)[:5]}")
     if held_risk_files:
         raw = pd.concat([pd.read_parquet(p) for p in held_risk_files], ignore_index=True)
         ref = {e["seed"]: e for e in episodes if e["arm"] == REFERENCE and not e.get("failed")}
@@ -1045,7 +1095,9 @@ def main(argv=None):
                                                int(rule["warmup"]))
             scored.append(e)
     q2 = question_two(episodes, arms, protocol["success_rule"]["question_2"], timing)
-    q1 = question_one(risks, labels, active, names, calibration, sorted(scored), rule)
+    blocking = [(s, arm, msg) for s, arm, msg in q2["failed"] if arm == REFERENCE] + \
+        [(s, "scoring", msg) for s, msg in q2["scoring_failed"]]
+    q1 = question_one(risks, labels, active, names, calibration, sorted(scored), rule, blocking)
     proj = projection(episodes, arms, len(protocol_seeds(protocol)), duration, float(protocol["duration_s"]),
                       a.procs)
     config.update(end_utc=time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),

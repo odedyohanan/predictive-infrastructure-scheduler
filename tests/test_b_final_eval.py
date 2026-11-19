@@ -411,3 +411,77 @@ def test_rehearsal_end_to_end(fe, tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as e:                           # never overwritten
         fe.main(argv)
     assert "refusing" in str(e.value)
+
+
+# ------------------------------------------------------------------ review fixes
+class RaisingPredictor:
+    """A predictor whose risk always raises (scoring failure)."""
+    name = "queueing"
+
+    def risk(self, rows, H, episode=None):
+        raise RuntimeError("predictor broke")
+
+
+def test_scoring_failure_keeps_the_r6_run(fe, tmp_path):
+    from pis.shards import Shard
+    (tmp_path / "pred.pkl").write_bytes(pickle.dumps({"queueing": RaisingPredictor()}))
+    params = {"incident": RULE, "alarms": {"predictor": None, "threshold": None, "low": None, "H": 20},
+              "duration_s": 12.0, "rule": RULE, "arms": ["r6"], "names": ["queueing"], "world_model": None,
+              "fitted": str(tmp_path / "pred.pkl"), "wm_n": 4, "advisor_params": None}
+    d = tmp_path / "s0000"
+    d.mkdir()
+    fe.run_shard(Shard("s0000", [3450]), d, params)
+    (rec,) = json.loads((d / fe.EPISODES_FILE).read_text())
+    assert rec["failed"] is None and rec["windows"] == 24 and "value_per_s" in rec
+    assert "predictor broke" in rec["scoring_failed"]
+    assert not (d / fe.RISKS_FILE).exists()
+    q = fe.question_two([rec], ["r6"], "not attempted", None)
+    assert q["failed"] == [] and q["scoring_failed"] == [(3450, rec["scoring_failed"])]
+
+
+def test_question_two_not_decidable_when_r6_or_advisor_failed(fe, tmp_path):
+    rule = fe.make_protocol(_files(tmp_path))["success_rule"]["question_2"]
+    for arm in ("r6", "advisor"):
+        eps = [e for e in _episodes() if not (e["seed"] == 3001 and e["arm"] == arm)]
+        eps.append(_rec(3001, arm, 0, 0, failed="RuntimeError: boom"))
+        s = fe.question_two(eps, ["r6", "advisor"], rule, TIMING_OK)["success"]
+        assert s["time_ok"] and s["value_ok"] and s["timing_ok"]               # would pass on the rest
+        assert not s["decidable"] and not s["met"]
+    eps = _episodes() + [_rec(3001, "loop_a", 0, 0, failed="RuntimeError: other arm")]
+    s = fe.question_two(eps, ["r6", "advisor", "loop_a"], rule, TIMING_OK)["success"]
+    assert s["decidable"] and s["met"]                                          # another arm does not block
+
+
+def test_report_says_not_decidable(fe, tmp_path):
+    p = fe.make_protocol(_files(tmp_path))
+    eps = [e for e in _episodes() if not (e["seed"] == 3001 and e["arm"] == "r6")]
+    eps.append(_rec(3001, "r6", 0, 0, failed="RuntimeError: boom"))
+    q2 = fe.question_two(eps, ["r6", "advisor"], p["success_rule"]["question_2"], TIMING_OK)
+    risks, labels, active = _risk_case()
+    q1 = fe.question_one(risks, labels, active, ["world_model", "queueing"], list(range(3400, 3410)),
+                         list(range(3000, 3010)), RULE, blocking=[(3001, "r6", "RuntimeError: boom")])
+    assert not q1["decidable"] and q1["verdict"]["world_model"] is True
+    text = fe.report_text(p, {"title": "Attempt 1"}, q2, q1, TIMING_OK, warnings=[])
+    assert "**Question 2: not decidable**" in text and "**Question 1: not decidable**" in text
+    assert "SUCCESS" not in text
+    assert "not_decidable" in p["success_rule"]
+
+
+def test_question_one_refuses_overlapping_episodes(fe):
+    risks, labels, active = _risk_case()
+    with pytest.raises(ValueError, match="overlap"):
+        fe.question_one(risks, labels, active, ["world_model", "queueing"], list(range(3400, 3410)),
+                        [3400, 3000], RULE)
+
+
+def test_validate_protocol_seeds_and_duration(fe, tmp_path):
+    p = fe.make_protocol(_files(tmp_path))
+    assert any("held-out" in e for e in fe.validate_protocol({**p, "seeds": {"first": 3000, "last": 3049}}))
+    assert any("duration" in e for e in fe.validate_protocol({**p, "duration_s": 60.0}))
+
+
+def test_value_bound_uses_the_absolute_r6_mean(fe, tmp_path):
+    rule = fe.make_protocol(_files(tmp_path))["success_rule"]["question_2"]
+    eps = [dict(e, value_per_s=-e["value_per_s"]) for e in _episodes()]
+    s = fe.question_two(eps, ["r6", "advisor"], rule, TIMING_OK)["success"]
+    assert s["value_bound"] < 0
