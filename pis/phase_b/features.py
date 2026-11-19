@@ -90,14 +90,18 @@ def encode_records(records: list[dict], known) -> Window:
     return Window(s, p, known_vector(known))
 
 
-def rows_from_records(records: list[dict], known, slo_ms: float = incidents.SLO_MS) -> pd.DataFrame:
-    """Live records as rows with the store's state, raw-count, policy, violation and known columns.
+def rows_from_records(records: list[dict], known, slo_ms: float = incidents.SLO_MS,
+                      episode: int | None = None) -> pd.DataFrame:
+    """Live records as rows with the store's state, raw-count, policy, violation and known columns (and an
+    `episode` column when `episode` is given).
 
     `deg_active` comes from the records' degradation block when present (False otherwise); predictors
     never read it, labels do.
     """
     w = encode_records(records, known)
     cols: dict[str, object] = {"window": np.arange(len(records), dtype=np.int64)}
+    if episode is not None:
+        cols["episode"] = np.full(len(records), int(episode), dtype=np.int64)
     for i, c in enumerate(STATE_COLS[:39]):
         cols[c] = w.states[:, i]
     for c, k in zip(STATE_COLS[39:], history.RAW_COUNTS):

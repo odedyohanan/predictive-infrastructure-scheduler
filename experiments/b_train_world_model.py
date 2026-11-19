@@ -72,8 +72,23 @@ def read_incident(path: Path, horizon: int | None) -> dict:
     return {**cfg, "H": int(horizon or cfg["H"])}
 
 
+def check_mc_config(labels: Path, inc: dict) -> None:
+    """The Monte Carlo labels must come from a run with the same rule (k, interval, majority, warm-up) and H;
+    their run's config.json sits next to the labels file."""
+    cfg_path = Path(labels).parent / "config.json"
+    if not cfg_path.exists():
+        raise ValueError("the Monte Carlo labels have no run config.json next to them")
+    cfg = runs.read_json(cfg_path)
+    want = {"k": int(inc["k"]), "interval": int(inc["interval"]), "majority": float(inc["majority"]),
+            "warmup": int(inc["warmup"]), "horizon": int(inc["H"])}
+    diff = [k for k, v in want.items() if k not in cfg or cfg[k] != v]
+    if diff:
+        raise ValueError(f"the Monte Carlo labels were made with a different {', '.join(diff)} "
+                         f"({ {k: cfg.get(k) for k in diff} } vs { {k: want[k] for k in diff} })")
+
+
 def note_text(name: str, rec: dict, hist: list[dict], cal: dict, verdict) -> str:
-    from pis.phase_b.wm_prob import OUTPUTS
+    from pis.phase_b.wm_prob import NONZERO_OUTPUTS, OUTPUTS
     h = str(cal["horizon"])
     lines = [f"# Probabilistic GRU world model {name}", "",
              f"Checkpoint sha256 `{rec['sha256']}`; {rec['epochs_run']} epochs, best validation NLL "
@@ -87,14 +102,21 @@ def note_text(name: str, rec: dict, hist: list[dict], cal: dict, verdict) -> str
     lines += [f"| {e['epoch']} | {e['train_loss']:.4f} | {e['val_loss']:.4f} |" for e in hist[::step]]
     lines += ["", f"## Calibration on {len(cal['seeds'])} episodes ({cal['starts']} starts, {cal['n']} samples, "
               f"H = {h})", "",
-              f"Coverage of the central {cal['level']:.0%} interval and CRPS (encoded units):", "",
-              "| output | " + " | ".join(f"cov h={x}" for x in cal["horizons"]) + " | "
-              + " | ".join(f"CRPS h={x}" for x in cal["horizons"]) + " |",
-              "|---|" + "---|" * (2 * len(cal["horizons"]))]
+              f"Coverage of the central {cal['level']:.0%} interval and CRPS (encoded units). Overdue and late "
+              "counts are 0 in most windows, where an interval containing 0 covers for free: they are shown on "
+              "all windows and on the windows with a non-zero truth (the ladder judges the latter); p99 only on "
+              "windows with completions. n = windows judged at H.", "",
+              "| output | windows | " + " | ".join(f"cov h={x}" for x in cal["horizons"]) + " | "
+              + " | ".join(f"CRPS h={x}" for x in cal["horizons"]) + " | n |",
+              "|---|---|" + "---|" * (2 * len(cal["horizons"]) + 1)]
     fmt = lambda v: "n/a" if v is None else f"{v:.3f}"  # noqa: E731
     for o in OUTPUTS:
-        lines.append(f"| {o} | " + " | ".join(fmt(cal["coverage"][o][str(x)]) for x in cal["horizons"]) + " | "
-                     + " | ".join(fmt(cal["crps"][o][str(x)]) for x in cal["horizons"]) + " |")
+        groups = [("all" if o != "a.p99_ms" else "with completions", cal["coverage"], cal["crps"], cal["counts"])]
+        if o in NONZERO_OUTPUTS:
+            groups.append(("non-zero", cal["coverage_nonzero"], cal["crps_nonzero"], cal["counts_nonzero"]))
+        for label, cv, cr, cn in groups:
+            lines.append(f"| {o} | {label} | " + " | ".join(fmt(cv[o][str(x)]) for x in cal["horizons"]) + " | "
+                         + " | ".join(fmt(cr[o][str(x)]) for x in cal["horizons"]) + f" | {cn[o][h]} |")
     if cal.get("brier") is not None:
         lines += ["", f"Brier of the rollout incident risk vs Monte Carlo labels: {cal['brier']:.4f} "
                   f"(base rate {cal['base_rate']:.3f}: {cal['brier_base']:.4f}); skill {fmt(cal['brier_skill'])} "
@@ -107,8 +129,8 @@ def note_text(name: str, rec: dict, hist: list[dict], cal: dict, verdict) -> str
         lines += ["", f"Intervention rank agreement (Spearman of predicted vs branched effect on mean "
                   f"a.queue_overdue at h={r['horizon']}, {r['reseeds']} reseeds): {fmt(r['spearman'])} over "
                   f"{r['effects']} effects on {r['states']} states ({per})."]
-    lines += ["", "Ladder criterion (coverage at H within [0.70, 0.90] for the three outputs and Brier skill "
-              "> 0): " + {True: "PASS", False: "FAIL", None: "undecided (no Brier skill)"}[verdict] + "."]
+    lines += ["", "Ladder criterion (coverage at H within [0.70, 0.90] for the three outputs, non-zero windows for "
+              "overdue and late, and Brier skill > 0): " + {True: "PASS", False: "FAIL", None: "undecided (no Brier skill)"}[verdict] + "."]
     return "\n".join(lines) + "\n"
 
 
@@ -172,6 +194,12 @@ def main(argv=None) -> dict:
                             a.horizon if smoke else None)
     except ValueError as e:
         raise SystemExit(f"refusing to run: {e}")
+    mc_path = ROOT / a.mc_labels if not Path(a.mc_labels).is_absolute() else Path(a.mc_labels)
+    if mc_path.exists():
+        try:
+            check_mc_config(mc_path, inc)
+        except ValueError as e:
+            raise SystemExit(f"refusing to run: {e}")
     if not train_s or not val_s:
         raise SystemExit("refusing to run: need training and validation (seed % 10 == 8) history seeds")
 
@@ -207,7 +235,6 @@ def main(argv=None) -> dict:
     print(f"trained {len(hist)} epochs in {train_seconds} s, best val NLL {rec['best_val_loss']:.4f}", flush=True)
 
     rule = incidents.IncidentRule(int(inc["k"]), int(inc["interval"]), float(inc["majority"]))
-    mc_path = ROOT / a.mc_labels if not Path(a.mc_labels).is_absolute() else Path(a.mc_labels)
     mc = pd.read_parquet(mc_path) if mc_path.exists() else None
     cal = wm_prob.calibration(model, store, calib, inc["H"], rule=rule, mc=mc, n=a.samples, every=a.every,
                               warmup=int(inc["warmup"]), rank_states=a.rank_states, rank_reseeds=a.rank_reseeds,
@@ -220,7 +247,9 @@ def main(argv=None) -> dict:
     runs.write_json(raw, {k: v for k, v in cal.items() if k != "rank"}
                     | {"rank": None if cal["rank"] is None else
                        {k: v for k, v in cal["rank"].items() if k != "rows"}, "ladder_pass": verdict})
-    print(f"calibration: coverage at H {json.dumps({o: cal['coverage'][o][str(inc['H'])] for o in wm_prob.OUTPUTS})}"
+    judged = {o: (cal["coverage_nonzero"] if o in wm_prob.NONZERO_OUTPUTS else cal["coverage"])[o][str(inc["H"])]
+              for o in wm_prob.OUTPUTS}
+    print(f"calibration: coverage at H (non-zero for counts) {json.dumps(judged)}"
           f"; brier skill {cal['brier_skill']}; rank {cal['rank'] and cal['rank']['spearman']}; "
           f"ladder {verdict}", flush=True)
     return {"recipe": rec, "calibration": cal, "ladder_pass": verdict}

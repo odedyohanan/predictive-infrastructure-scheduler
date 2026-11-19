@@ -1,11 +1,13 @@
 """Incident predictors: each turns the window rows seen so far into the risk that a new incident starts
 within the next H windows.
 
-Every predictor has `name`, `risk(window_rows, H) -> float` and, when it learns from data,
-`fit(store, seeds)`, which accepts history seeds only. `window_rows` are rows shaped like the store's
+Every predictor has `name`, `risk(window_rows, H, episode=None) -> float` and, when it learns from data,
+`fit(store, seeds)`, which accepts history seeds only (the private `_fit_frames` behind it takes frames
+directly and has no seed guard: tests only). `window_rows` are rows shaped like the store's
 window rows (`pis.phase_b.history`; live records through `features.rows_from_records`) of one episode, up
 to and including the current window, oldest first, with the episode's known_* columns
-(`features.join_known`). Predictors read only the state, raw-count, policy, violation and known columns,
+(`features.join_known`). `episode` names the episode the rows belong to when they carry no `episode`
+column (the analogue search needs it to leave the episode's own history out). Predictors read only the state, raw-count, policy, violation and known columns,
 never the degradation columns.
 
   WorldModelPredictor  share of sampled world-model futures (the policy in force held) with a new onset
@@ -39,7 +41,7 @@ NO_ONSET = 1 << 30
 class Predictor(Protocol):
     name: str
 
-    def risk(self, window_rows: pd.DataFrame, H: int) -> float:
+    def risk(self, window_rows: pd.DataFrame, H: int, episode: int | None = None) -> float:
         ...
 
 
@@ -196,7 +198,7 @@ class WorldModelPredictor:
         """The world model is trained by its own script; only the seed guard applies here."""
         _history(seeds)
 
-    def risk(self, window_rows: pd.DataFrame, H: int) -> float:
+    def risk(self, window_rows: pd.DataFrame, H: int, episode: int | None = None) -> float:
         from pis.phase_b.wm_prob import rollout_risk
         win = features.encode_rows(window_rows.iloc[-self.model.context:])
         if win.known is None:
@@ -213,7 +215,9 @@ class HazardPredictor:
 
     Features of window t (all from windows <= t): last value, mean and slope over the last 8 windows of the
     A-side SIGNALS (levels, slopes, the early signal = overdue slope, utilisation), the current violation
-    run and the violated share of the last 8 windows; standardised on the training windows.
+    run and the violated share of the last 8 windows; standardised on the training windows. The violation
+    run is counted over every row given (not cut at 8), so `hazards` computes the features on the whole
+    `window_rows`, exactly as training computes them on the whole episode.
     """
     name = "hazard"
 
@@ -227,10 +231,14 @@ class HazardPredictor:
         vf = _violation_features(rows["slo_v2_violation"].to_numpy(bool), self.window)
         return np.concatenate([last, mean, slope, vf], axis=1)
 
-    def fit(self, store, seeds) -> None:
-        self.fit_frames(history_frames(store, seeds))
+    def window_features(self, window_rows: pd.DataFrame) -> np.ndarray:
+        """Features of the newest row, as `hazards` uses them."""
+        return self.features(window_rows)[-1]
 
-    def fit_frames(self, frame: pd.DataFrame) -> None:
+    def fit(self, store, seeds) -> None:
+        self._fit_frames(history_frames(store, seeds))
+
+    def _fit_frames(self, frame: pd.DataFrame) -> None:
         xs, ds, caps = [], [], []
         for _, part in _episodes(frame):
             T = len(part)
@@ -245,15 +253,15 @@ class HazardPredictor:
         self.mu, self.sd = x.mean(axis=0), np.where(x.std(axis=0) < 1e-6, 1.0, x.std(axis=0))
         self.w, self.b = _fit_logistic_hazard((x - self.mu) / self.sd, d, cap, self.max_h, self.l2, self.iters)
 
-    def hazards(self, window_rows: pd.DataFrame, H: int) -> np.ndarray:
+    def hazards(self, window_rows: pd.DataFrame, H: int, episode: int | None = None) -> np.ndarray:
         if self.w is None:
             raise ValueError("fit the hazard model first")
         if H > self.max_h:
             raise ValueError(f"H = {H} exceeds the fitted {self.max_h} steps")
-        x = self.features(window_rows.iloc[-self.window:])[-1]
+        x = self.window_features(window_rows)
         return _sigmoid(float(((x - self.mu) / self.sd) @ self.w) + self.b[:H])
 
-    def risk(self, window_rows: pd.DataFrame, H: int) -> float:
+    def risk(self, window_rows: pd.DataFrame, H: int, episode: int | None = None) -> float:
         return float(1.0 - np.prod(1.0 - self.hazards(window_rows, H)))
 
 
@@ -261,7 +269,8 @@ class HazardPredictor:
 class AnalogueSearch:
     """k nearest history situations by the standardised summary of the last 16 windows (mean, slope and
     last value of the A-side SIGNALS); risk = share of them followed by an onset within H. Neighbours from
-    the queried episode are excluded. Reference windows lie after the warm-up and early enough that an
+    the queried episode (the `episode` argument, else the rows' `episode` column; one of them is required)
+    are excluded. Reference windows lie after the warm-up and early enough that an
     onset up to `max_h` windows later is visible in their episode."""
     name = "analogue"
 
@@ -275,9 +284,9 @@ class AnalogueSearch:
         return np.concatenate([mean, slope, last], axis=1)
 
     def fit(self, store, seeds) -> None:
-        self.fit_frames(history_frames(store, seeds))
+        self._fit_frames(history_frames(store, seeds))
 
-    def fit_frames(self, frame: pd.DataFrame) -> None:
+    def _fit_frames(self, frame: pd.DataFrame) -> None:
         es, ds, eps = [], [], []
         for ep, part in _episodes(frame):
             T = len(part)
@@ -294,22 +303,26 @@ class AnalogueSearch:
         self.ref_sq = (self.ref.astype(np.float64) ** 2).sum(axis=1)
         self.dist, self.ep = np.concatenate(ds), np.concatenate(eps)
 
-    def neighbours(self, window_rows: pd.DataFrame) -> np.ndarray:
+    def neighbours(self, window_rows: pd.DataFrame, episode: int | None = None) -> np.ndarray:
         if self.ref is None:
             raise ValueError("fit the analogue search first")
+        if episode is None:
+            if "episode" not in window_rows:
+                raise ValueError("the analogue search needs the rows' episode (argument or column) to leave "
+                                 "the episode's own history out")
+            episode = int(window_rows["episode"].iloc[-1])
         q = ((self.embed(window_rows.iloc[-self.window:])[-1] - self.mu) / self.sd).astype(np.float32)
         d2 = self.ref_sq - 2.0 * (self.ref @ q) + float(q @ q)
-        if "episode" in window_rows:
-            d2 = np.where(self.ep == int(window_rows["episode"].iloc[-1]), np.inf, d2)
+        d2 = np.where(self.ep == int(episode), np.inf, d2)
         k = min(self.k, int(np.isfinite(d2).sum()))
         if k == 0:
             raise ValueError("no reference windows outside the queried episode")
         return np.argpartition(d2, k - 1)[:k]
 
-    def risk(self, window_rows: pd.DataFrame, H: int) -> float:
+    def risk(self, window_rows: pd.DataFrame, H: int, episode: int | None = None) -> float:
         if H > self.max_h:
             raise ValueError(f"H = {H} exceeds the reference horizon {self.max_h}")
-        return float((self.dist[self.neighbours(window_rows)] <= H).mean())
+        return float((self.dist[self.neighbours(window_rows, episode)] <= H).mean())
 
 
 # ------------------------------------------------------------------ queueing
@@ -344,7 +357,7 @@ class QueueingModel:
         thr = np.maximum(0.01 * lam * WINDOW_S, 1.0)
         return np.log1p(np.maximum(peak, 0.0)) - np.log1p(thr)
 
-    def risk(self, window_rows: pd.DataFrame, H: int) -> float:
+    def risk(self, window_rows: pd.DataFrame, H: int, episode: int | None = None) -> float:
         z = self.statistic(window_rows.iloc[-self.window:], H)[-1]
         return float(_sigmoid(z / self.scale))
 
@@ -429,9 +442,9 @@ class ChangePoint:
                         axis=1)
 
     def fit(self, store, seeds) -> None:
-        self.fit_frames(history_frames(store, seeds), store.episodes())
+        self._fit_frames(history_frames(store, seeds), store.episodes())
 
-    def fit_frames(self, frame: pd.DataFrame, episodes: pd.DataFrame | None = None) -> None:
+    def _fit_frames(self, frame: pd.DataFrame, episodes: pd.DataFrame | None = None) -> None:
         if episodes is not None:
             quiet = set(episodes.loc[episodes.kind == "none", "seed"].astype(int))
             frame = frame[frame.episode.isin(quiet)]
@@ -454,5 +467,5 @@ class ChangePoint:
                       "bocpd": float(bocpd_short_mass(z[:, j], self.hazard, self.short, self.rmax)[-1]) * up}
         return out
 
-    def risk(self, window_rows: pd.DataFrame, H: int) -> float:
+    def risk(self, window_rows: pd.DataFrame, H: int, episode: int | None = None) -> float:
         return float(max(v for sc in self.scores(window_rows).values() for v in sc.values()))

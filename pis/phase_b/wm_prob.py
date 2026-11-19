@@ -43,8 +43,12 @@ BURN_IN = 8
 ROOM = 32           # training sequences are CONTEXT + ROOM long: rollouts of up to ROOM steps stay in range
 LOGVAR_MIN, LOGVAR_MAX = -12.0, 6.0
 OUTPUTS = ("a.queue_overdue", "a.late_new", "a.p99_ms")     # judged by the interval coverage
+# Counts that are 0 in most windows: an interval containing 0 covers those for free, so their coverage is
+# also reported (and judged) on the windows where the truth is non-zero.
+NONZERO_OUTPUTS = ("a.queue_overdue", "a.late_new")
 LEVEL = 0.8                                                  # central predictive interval
-RANK_TAG = 16_000_000        # intervention branch j of a state of episode s: RANK_TAG + s*1000 + j
+RANK_TAG = 16_000_000        # reseed j of every intervention branch at any state of episode s: RANK_TAG + s*1000 + j
+                             # (shared by the episode's states and by all policies of a state)
 RANK_HORIZON = 5
 INTERVENTION_OUTCOME = "a.queue_overdue"
 
@@ -370,7 +374,9 @@ def _episode_rows(store, seed: int, eps: pd.DataFrame) -> pd.DataFrame:
 def predictive_scores(model, store, seeds, horizon: int, n: int = 64, every: int = 20,
                       warmup: int = incidents.WARMUP, seed: int = 0) -> dict:
     """Coverage of the central 80 % interval and CRPS at horizons 1, 5 and H for OUTPUTS, with the real
-    future policies fed in. p99 is judged only where the true window completed requests."""
+    future policies fed in. p99 is judged only where the true window completed requests. For
+    NONZERO_OUTPUTS coverage and CRPS are also given over the windows whose true value is non-zero
+    (`coverage_nonzero`, `crps_nonzero`); `counts`, `counts_nonzero` hold the numbers of windows."""
     eps = store.episodes().set_index("seed")
     hs = sorted({1, min(5, horizon), horizon})
     idx = [features.IDX[o] for o in OUTPUTS]
@@ -392,15 +398,21 @@ def predictive_scores(model, store, seeds, horizon: int, n: int = 64, every: int
                         continue
                     smp[(o, h)].append(r[:, h - 1, i])
                     tru[(o, h)].append(y)
-    cov = {o: {} for o in OUTPUTS}
-    cr = {o: {} for o in OUTPUTS}
+    cov, cr, cnt = ({o: {} for o in OUTPUTS} for _ in range(3))
+    cov_nz, cr_nz, cnt_nz = ({o: {} for o in NONZERO_OUTPUTS} for _ in range(3))
     for (o, h), xs in smp.items():
-        if xs:
-            S, Y = np.stack(xs, axis=1), np.array(tru[(o, h)])
-            cov[o][str(h)], cr[o][str(h)] = interval_coverage(S, Y), crps(S, Y)
-        else:
-            cov[o][str(h)] = cr[o][str(h)] = None
-    return {"coverage": cov, "crps": cr, "starts": starts, "horizons": hs}
+        S = np.stack(xs, axis=1) if xs else np.zeros((n, 0))
+        Y = np.array(tru[(o, h)], dtype=float)
+        key = str(h)
+        cnt[o][key] = len(Y)
+        cov[o][key], cr[o][key] = (interval_coverage(S, Y), crps(S, Y)) if len(Y) else (None, None)
+        if o in NONZERO_OUTPUTS:
+            nz = Y > 0
+            cnt_nz[o][key] = int(nz.sum())
+            cov_nz[o][key], cr_nz[o][key] = ((interval_coverage(S[:, nz], Y[nz]), crps(S[:, nz], Y[nz]))
+                                            if nz.any() else (None, None))
+    return {"coverage": cov, "crps": cr, "counts": cnt, "coverage_nonzero": cov_nz, "crps_nonzero": cr_nz,
+            "counts_nonzero": cnt_nz, "starts": starts, "horizons": hs}
 
 
 def brier(model, store, mc: pd.DataFrame, seeds, rule, horizon: int, n: int = 64,
@@ -535,10 +547,14 @@ def calibration(model, store, seeds, horizon: int, rule: incidents.IncidentRule 
 
 
 def ladder_pass(cal: dict, lo: float = 0.70, hi: float = 0.90) -> bool | None:
-    """Rung passes: 80 % interval coverage at H within [lo, hi] for the three outputs and Brier skill > 0.
-    None when the Brier skill is unavailable."""
+    """Rung passes: 80 % interval coverage at H within [lo, hi] for the three outputs (on the windows with a
+    non-zero truth for NONZERO_OUTPUTS, on windows with completions for p99) and Brier skill > 0. None when
+    the coverage passes but the Brier skill is unavailable."""
     h = str(cal["horizon"])
-    cov_ok = all(cal["coverage"][o].get(h) is not None and lo <= cal["coverage"][o][h] <= hi for o in OUTPUTS)
+
+    def judged(o):
+        return (cal["coverage_nonzero"] if o in NONZERO_OUTPUTS else cal["coverage"])[o].get(h)
+    cov_ok = all(judged(o) is not None and lo <= judged(o) <= hi for o in OUTPUTS)
     if cal.get("brier_skill") is None:
         return None if cov_ok else False
     return bool(cov_ok and cal["brier_skill"] > 0)

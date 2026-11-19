@@ -153,16 +153,48 @@ def test_sample_rollouts_shape_and_clipping():
     np.testing.assert_array_equal(m.sample_rollouts(_window(), per_step, None, 7, 5, seed=1), out)
 
 
-def test_stepwise_rollout_equals_full_recompute():
-    """Feeding sampled states one step at a time gives what re-running the whole sequence gives."""
-    hist = _window(T=4)
-    step = _tiny_model(seed=2, context=8, room=8, hi=np.full(43, 50.0, np.float32))
-    full = _tiny_model(seed=2, context=100, room=0, hi=np.full(43, 50.0, np.float32))
-    a = step.sample_rollouts(hist, hist.policies[-1], None, horizon=6, n=3, seed=5)
-    b = full.sample_rollouts(hist, hist.policies[-1], None, horizon=6, n=3, seed=5)
-    np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-5)
-    long = step.sample_rollouts(_window(T=20), hist.policies[-1], None, horizon=30, n=2, seed=5)
-    assert long.shape == (2, 30, 43) and np.isfinite(long).all()      # beyond the room: restarts
+def _reference_rollout(m, hist, pol, horizon, n, seed):
+    """Rollout by re-running the network on the whole input sequence of the current segment at every step.
+
+    A segment starts at the last `context` inputs and runs while it has fewer than `context + room` inputs
+    before the new one; then a new segment starts at the last `context` inputs (fresh recurrent state)."""
+    import torch
+    C, longest = m.context, m.context + m.room
+    k = hist.known
+    S, P = hist.states[-C:], hist.policies[-C:]
+    inputs = [np.tile(np.concatenate([S[j], P[j + 1], k]), (n, 1)) for j in range(len(S) - 1)]
+    s = np.tile(S[-1], (n, 1)).astype(np.float32)
+    lo, hi = m.bounds
+    rng = np.random.default_rng(seed)
+    out, b = [], None
+    for h in range(horizon):
+        inputs.append(np.concatenate([s, np.tile(pol, (n, 1)), np.tile(k, (n, 1))], axis=1))
+        cnt = len(inputs)
+        if b is None or cnt - 1 - b >= longest:
+            b = max(cnt - C, 0)
+        x = np.stack(inputs[b:cnt], axis=1).astype(np.float32)
+        with torch.no_grad():
+            mean, logvar, _ = m.net(torch.from_numpy(m.x_norm.transform(x)))
+        mean, logvar = mean[:, -1].numpy(), logvar[:, -1].numpy()
+        delta = (mean + np.exp(0.5 * logvar) * rng.standard_normal(mean.shape)) * m.y_norm.std + m.y_norm.mean
+        s = np.minimum(np.maximum(s + delta.astype(np.float32), np.maximum(lo, 0)), hi)
+        out.append(s)
+    return np.stack(out, axis=1)
+
+
+@pytest.mark.parametrize("context,room,T,horizon", [(8, 8, 4, 6), (8, 8, 20, 6), (3, 2, 10, 12)])
+def test_stepwise_rollout_equals_whole_sequence(context, room, T, horizon):
+    """Each incremental step equals the network run on the whole concatenated sequence (same noise); the last
+    case crosses context + room several times and pins the restart."""
+    hist = _window(T=T, seed=4)
+    m = _tiny_model(seed=2, context=context, room=room, hi=np.full(43, 50.0, np.float32))
+    a = m.sample_rollouts(hist, hist.policies[-1], None, horizon=horizon, n=3, seed=5)
+    b = _reference_rollout(m, hist, hist.policies[-1], horizon, 3, 5)
+    np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-4)
+    if room == 2:          # without the restart the trajectory differs: the test can tell
+        no_restart = _tiny_model(seed=2, context=context, room=100, hi=np.full(43, 50.0, np.float32))
+        c = no_restart.sample_rollouts(hist, hist.policies[-1], None, horizon=horizon, n=3, seed=5)
+        assert np.abs(c - a).max() > 1e-3
 
 
 def test_sample_rollouts_accepts_policy_dict():
@@ -279,6 +311,29 @@ def test_rollout_risk_counts_new_onsets_only():
     assert wm_prob.rollout_risk(Stub(0), win, rows2, rule, horizon=5, n=8, warmup=20) == 0.0
 
 
+def test_ladder_uses_nonzero_coverage():
+    cov = {"a.queue_overdue": {"10": 0.95}, "a.late_new": {"10": 0.97}, "a.p99_ms": {"10": 0.8}}
+    nz = {"a.queue_overdue": {"10": 0.8}, "a.late_new": {"10": 0.75}}
+    cal = {"horizon": 10, "coverage": cov, "coverage_nonzero": nz, "brier_skill": 0.1}
+    assert wm_prob.ladder_pass(cal) is True                   # all-window coverage inflated by zeros: ignored
+    assert wm_prob.ladder_pass({**cal, "brier_skill": -0.1}) is False
+    assert wm_prob.ladder_pass({**cal, "brier_skill": None}) is None
+    bad = {"a.queue_overdue": {"10": 0.6}, "a.late_new": {"10": 0.75}}
+    assert wm_prob.ladder_pass({**cal, "coverage_nonzero": bad}) is False
+    assert wm_prob.ladder_pass({**cal, "coverage": {**cov, "a.p99_ms": {"10": 0.95}}}) is False
+
+
+def test_predictive_scores_report_nonzero_windows(tmp_path):
+    _synthetic_store(tmp_path, [3108])
+    st = history.Store(tmp_path)
+    m = _tiny_model(context=4, hi=np.full(43, 50.0, np.float32))
+    r = wm_prob.predictive_scores(m, st, [3108], horizon=3, n=8, every=1, warmup=4)
+    for o in ("a.queue_overdue", "a.late_new"):
+        assert set(r["coverage_nonzero"][o]) == {"1", "3"}
+        assert 0 < r["counts_nonzero"][o]["3"] < r["counts"][o]["3"]
+    assert "a.p99_ms" not in r["coverage_nonzero"]
+
+
 # ------------------------------------------------------------------ script guards
 def test_script_refuses_non_history_seeds(tmp_path):
     with pytest.raises(SystemExit, match="refusing"):
@@ -300,6 +355,25 @@ def test_script_real_run_refuses_dirty_tree(monkeypatch):
     monkeypatch.setattr(runs, "tree_dirty", lambda ignore=(): True)
     with pytest.raises(SystemExit, match="uncommitted"):
         script.main(["--seeds", "3100-3101"])
+
+
+def test_mc_labels_must_match_the_rule(tmp_path):
+    inc = {"k": 7, "interval": 28, "majority": 0.5, "warmup": 20, "H": 6}
+    d = tmp_path / "mc"
+    d.mkdir()
+    (d / "labels.parquet").write_text("")
+    with pytest.raises(ValueError, match="config"):
+        script.check_mc_config(d / "labels.parquet", inc)
+    import json
+    cfg = {"k": 7, "interval": 28, "majority": 0.5, "warmup": 20, "horizon": 20}
+    (d / "config.json").write_text(json.dumps(cfg))
+    with pytest.raises(ValueError, match="horizon"):
+        script.check_mc_config(d / "labels.parquet", inc)
+    (d / "config.json").write_text(json.dumps({**cfg, "horizon": 6, "k": 5}))
+    with pytest.raises(ValueError, match="k"):
+        script.check_mc_config(d / "labels.parquet", inc)
+    (d / "config.json").write_text(json.dumps({**cfg, "horizon": 6}))
+    script.check_mc_config(d / "labels.parquet", inc)
 
 
 def test_script_needs_incident_config(tmp_path, monkeypatch):

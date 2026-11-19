@@ -117,7 +117,7 @@ def train_frame():
 
 def test_hazard_rising_vs_flat(train_frame):
     p = predictors.HazardPredictor(RULE, max_h=20, iters=300)
-    p.fit_frames(train_frame)
+    p._fit_frames(train_frame)
     early, late, quiet = _rising_vs_flat(p)
     assert late > 0.5 and late > early + 0.3
     assert quiet < 0.1
@@ -130,16 +130,43 @@ def test_hazard_rising_vs_flat(train_frame):
 
 def test_analogue_rising_vs_flat(train_frame):
     p = predictors.AnalogueSearch(RULE, k=20, max_h=20)
-    p.fit_frames(train_frame)
+    p._fit_frames(train_frame)
     early, late, quiet = _rising_vs_flat(p)
     assert late > 0.5 and late > early + 0.3
     assert quiet < 0.1
 
 
+def test_hazard_features_same_in_fit_and_risk(train_frame):
+    """A violation run longer than the 8-window feature span: risk() sees the same features as training."""
+    p = predictors.HazardPredictor(RULE, max_h=20, iters=20)
+    p._fit_frames(train_frame)
+    ep = synth(3100, onset=60, ramp=10)                    # violated from window 60 on: a 40-window run at 99
+    full = p.features(ep)                                  # the training path: the whole episode
+    for t in (65, 99, 150):
+        np.testing.assert_allclose(p.window_features(_rows(ep, t)), full[t])
+    assert full[99, -2] == pytest.approx(np.log1p(40))     # the run is not cut at the feature span
+
+
+def test_analogue_needs_episode():
+    p = predictors.AnalogueSearch(RULE, k=5, max_h=20)
+    p._fit_frames(pd.concat([synth(3100, onset=120), synth(3101), synth(3102)], ignore_index=True))
+    rows = _rows(synth(3100, onset=120), 112).drop(columns="episode")
+    with pytest.raises(ValueError, match="episode"):
+        p.risk(rows, 10)
+    assert p.risk(rows, 10, episode=3100) == 0.0           # its own build-up excluded
+    assert p.risk(rows, 10, episode=3555) > 0.5
+
+
+def test_every_predictor_takes_episode():
+    rows = _rows(synth(3100), 60)
+    for p in (predictors.QueueingModel(RULE),):
+        assert 0 <= p.risk(rows, 10, episode=3100) <= 1
+
+
 def test_analogue_excludes_same_episode():
     ref = pd.concat([synth(3100, onset=120), synth(3101), synth(3102)], ignore_index=True)
     p = predictors.AnalogueSearch(RULE, k=5, max_h=20)
-    p.fit_frames(ref)
+    p._fit_frames(ref)
     query = _rows(synth(3100, onset=120), 112)
     assert p.risk(query, 10) == 0.0                     # the only build-up is its own: excluded
     assert not (p.ep[p.neighbours(query)] == 3100).any()
@@ -173,7 +200,7 @@ def test_queueing_calibration_fits_scale():
 
 def test_change_point_rising_vs_flat(train_frame):
     p = predictors.ChangePoint()
-    p.fit_frames(train_frame[train_frame.episode % 2 == 0])
+    p._fit_frames(train_frame[train_frame.episode % 2 == 0])
     early, late, quiet = _rising_vs_flat(p)
     assert late > 0.5 and late > early + 0.3
     assert quiet < 0.1
