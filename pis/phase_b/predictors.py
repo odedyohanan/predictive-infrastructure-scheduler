@@ -366,13 +366,15 @@ class QueueingModel:
         seeds = [int(s) for s in seeds]
         seed_ranges.check(seeds, "CALIBRATION")
         eps = store.episodes()
-        zs, ys = [], []
+        parts = []
         for s in seeds:
             n = int(eps.loc[eps.seed == s, "windows"].iloc[0])
-            part = features.join_known(store.window_rows(s, 0, n), eps)
-            z, y = self._labelled(part, H)
-            zs.append(z)
-            ys.append(y)
+            parts.append(features.join_known(store.window_rows(s, 0, n), eps))
+        return self.calibrate_episodes(parts, H, grid)
+
+    def calibrate_episodes(self, parts: list[pd.DataFrame], H: int, grid=None) -> float:
+        """`calibrate` on whole-episode row frames (one per episode); no seed guard: callers check seeds."""
+        zs, ys = zip(*(self._labelled(part, H) for part in parts))
         return self.calibrate_arrays(np.concatenate(zs), np.concatenate(ys), grid)
 
     def _labelled(self, part: pd.DataFrame, H: int) -> tuple[np.ndarray, np.ndarray]:
