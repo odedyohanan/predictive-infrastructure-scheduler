@@ -63,6 +63,13 @@ def test_degradation_factor():
     assert Degradation("none", 0.0, 0.0, 0.0).factor(50.0) == 0.0
 
 
+def test_onset_window_is_active():
+    sc = _scenario("leak", onset=2.0, ramp=2.0, duration=4.0)
+    ds = DegradedSim(sc)
+    flags = [ds.run_window(adapters.initial_policy())["phase_b"]["active"] for _ in range(8)]
+    assert flags == [False] * 4 + [True] * 4               # the window starting at 2.0 s is active
+
+
 def test_no_degradation_is_identical():
     sc = _scenario("none", duration=20.0)
     ds = DegradedSim(sc)

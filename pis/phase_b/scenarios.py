@@ -145,7 +145,8 @@ class DegradedSim:
         self.sim = Simulator(sc.spec, sc.seed, sc.duration_s)
 
     def run_window(self, policy: dict) -> dict:
-        d, t = self.scenario.degradation, self.sim.t
+        d = self.scenario.degradation
+        t = round(self.sim.t, 3)      # window start; sim.t accumulates 1 ms steps and drifts
         f = d.factor(t)
         if d.kind != "none" and d.kind not in STEP_KINDS:
             self.sim.spec = degraded_spec(self.scenario.spec, d.kind, d.magnitude * f) if f > 0 \
