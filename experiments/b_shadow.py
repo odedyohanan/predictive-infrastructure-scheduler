@@ -132,6 +132,23 @@ def for_episode(preds: dict, episode: int) -> None:
         preds["world_model"].seed = WM_TAG + int(episode) * 1000
 
 
+def episode_risks(preds: dict, names, rows, H: int, warmup: int, episode: int, seconds: dict | None = None) -> dict:
+    """Risk series of each predictor over one episode's rows (NaN before the warm-up): at window t from the
+    rows up to t only, the degradation columns dropped. Adds the time spent per predictor to `seconds`."""
+    rows = rows.drop(columns=[c for c in HIDDEN if c in rows.columns])
+    for_episode(preds, episode)
+    T = len(rows)
+    risk = {n: np.full(T, np.nan) for n in names}
+    for t in range(warmup, T):
+        seen = rows.iloc[:t + 1]
+        for n in names:
+            t0 = time.perf_counter()
+            risk[n][t] = preds[n].risk(seen, H, episode=episode)
+            if seconds is not None:
+                seconds[n] += time.perf_counter() - t0
+    return risk
+
+
 def run_shard(shard, shard_dir: Path, params: dict) -> None:
     """Risk series of every predictor for the shard's episodes (NaN before the warm-up)."""
     import pandas as pd
@@ -151,15 +168,7 @@ def run_shard(shard, shard_dir: Path, params: dict) -> None:
         ep = int(ep)
         T = int(eps.loc[ep, "windows"])
         rows = features.join_known(store.window_rows(ep, 0, T), eps.reset_index())
-        rows = rows.drop(columns=[c for c in HIDDEN if c in rows.columns])
-        for_episode(preds, ep)
-        risk = {n: np.full(T, np.nan) for n in names}
-        for t in range(warmup, T):
-            seen = rows.iloc[:t + 1]
-            for n in names:
-                t0 = time.perf_counter()
-                risk[n][t] = preds[n].risk(seen, H, episode=ep)
-                seconds[n] += time.perf_counter() - t0
+        risk = episode_risks(preds, names, rows, H, warmup, ep, seconds)
         windows += max(T - warmup, 0)
         frames.append(pd.DataFrame({"episode": np.full(T, ep, dtype=np.int64),
                                     "window": np.arange(T, dtype=np.int64), **risk}))
