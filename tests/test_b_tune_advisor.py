@@ -131,3 +131,21 @@ def test_shadow_wm_n_real_runs_need_the_shadow_config(tune, tmp_path):
         tune.shadow_wm_n(fitted, "abc", None, smoke=False)              # no silent default
     assert tune.shadow_wm_n(fitted, "def", None, smoke=True) == 32      # smoke: stand-ins allowed
     assert tune.shadow_wm_n(fitted, "def", 8, smoke=True) == 8
+
+
+def test_value_bound_uses_the_absolute_r6_mean(tune):
+    cfg = [{"eps": 0.1, "n": 8}]
+    a = tune.arm_name(cfg[0])
+    eps = []
+    for s in range(6):
+        eps += [_ep(s, "r6", 5, -100.0 - s), _ep(s, a, 4, -100.0 - s - 0.2 - 0.01 * s)]
+    out = tune.summarise(eps, cfg)[a]
+    assert out["value_ok"]                                   # -0.2 is within 1 % of |R6| = 102.5
+
+
+def test_note_explains_the_eps_grid_with_few_futures(tune):
+    cfg = {"label": "smoke", "seeds": [3450], "duration_s": 30.0, "alarms": {"predictor": "hazard", "threshold": 0.4,
+           "low": 0.28, "H": 20}, "m": 4, "h_max": 20, "step_a": {"slo_lam": 40.0, "mu": 8.0},
+           "world_model_sha256": "x", "grid": tune.grid()}
+    text = tune.note_text(cfg, {}, None, {"r6_s": 1.0, "advisor_s": 1.0, "projected_h": 1.0})
+    assert "p = 0" in text and "n = 8" in text

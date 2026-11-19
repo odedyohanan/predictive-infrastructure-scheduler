@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import pickle
 import sys
 import time
@@ -347,8 +346,7 @@ def question_one(res: dict) -> dict:
 
 
 # ------------------------------------------------------------------ note
-def _f(x, fmt="{:.3f}") -> str:
-    return "-" if x is None or (isinstance(x, float) and not math.isfinite(x)) else fmt.format(x)
+_f = partial(runs.fmt, default="{:.3f}")
 
 
 def note_text(cfg: dict, res: dict, q1: dict, best: str | None, gate_line: tuple[str, str], timing: dict) -> str:
@@ -456,6 +454,13 @@ def shadow(store, rule: dict, names, fit_seeds, calibration, selection, world_mo
             if label != "smoke":
                 raise ValueError(msg)
             warnings.append(msg)
+    if mc_path is not None and Path(mc_path).exists():
+        try:
+            runs.check_mc_config(Path(mc_path), rule)
+        except ValueError as e:
+            if label != "smoke":
+                raise
+            warnings.append(f"Monte Carlo labels not checked against the rule ({e})")
     cfg = {"label": label, "store": str(store_path), "rule": rule, "names": names, "fit_seeds": list(fit_seeds),
            "calibration": calibration, "selection": selection, "world_model_sha256": wm_sha, "wm_n": wm_n,
            "overrides": overrides or {}, "shard_size": SHARD_SIZE, "wm_tag": WM_TAG}
@@ -463,6 +468,12 @@ def shadow(store, rule: dict, names, fit_seeds, calibration, selection, world_mo
     cfg["code_head"] = runs.read_json(out / "config.json").get("code_head") or runs.git_head()
     out.mkdir(parents=True, exist_ok=True)
     _check_config(out, cfg)
+    if not (out / "config.json").exists():
+        # the configuration is pinned before the fitted predictors exist: a crash in between can never leave
+        # a pickle that a later run with another configuration would reuse
+        tmp = out / "config.json.tmp"
+        tmp.write_text(json.dumps(json.loads(json.dumps(cfg)), indent=2, sort_keys=True) + "\n")
+        tmp.replace(out / "config.json")
     fitted = out / FITTED_FILE
     if not fitted.exists():
         H = int(rule["H"])

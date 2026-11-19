@@ -369,3 +369,36 @@ def test_load_predictors_shared_with_the_advisor(shadow, tmp_path):
         shadow.load_predictors(tmp_path / "p.pkl", ["hazard"], rule)
     with pytest.raises(ValueError):
         shadow.load_predictors(None, ["world_model"], rule)
+
+
+def test_shadow_pins_its_config_before_the_fitted_predictors(shadow, tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    rule = {"k": 3, "interval": 12, "majority": 0.5, "warmup": 20, "H": 20, "min_lead_windows": 2}
+    args = dict(store=store, rule=rule, names=["queueing"], fit_seeds=list(range(3100, 3112)),
+                calibration=list(range(3400, 3406)), selection=list(range(3450, 3453)), world_model=None, wm_n=4,
+                mc_path=None, out=tmp_path / "shadow", note=tmp_path / "note.md",
+                alarms_path=tmp_path / "alarms.json", procs=1, label="smoke")
+
+    def crash(*a, **kw):
+        raise RuntimeError("killed while fitting")
+    monkeypatch.setattr(shadow, "make_predictors", crash)
+    with pytest.raises(RuntimeError):
+        shadow.shadow(**args)
+    assert (tmp_path / "shadow" / "config.json").exists() and not (tmp_path / "shadow" / "predictors.pkl").exists()
+    with pytest.raises(ValueError, match="different configuration"):
+        shadow.shadow(**{**args, "rule": {**rule, "H": 10}})
+
+
+def test_shadow_checks_the_monte_carlo_config(shadow, tmp_path):
+    store = _store(tmp_path)
+    pd.DataFrame({"episode": [3451], "window": [30], "risk": [0.5]}).to_parquet(tmp_path / "labels.parquet")
+    (tmp_path / "config.json").write_text(json.dumps({"k": 3, "interval": 12, "majority": 0.5, "warmup": 20,
+                                                      "horizon": 10}))
+    rule = {"k": 3, "interval": 12, "majority": 0.5, "warmup": 20, "H": 20, "min_lead_windows": 2}
+    args = dict(store=store, rule=rule, names=["queueing"], fit_seeds=list(range(3100, 3112)),
+                calibration=list(range(3400, 3406)), selection=list(range(3450, 3453)), world_model=None, wm_n=4,
+                mc_path=tmp_path / "labels.parquet", out=tmp_path / "shadow", note=tmp_path / "note.md",
+                alarms_path=tmp_path / "alarms.json", procs=1, label="")
+    with pytest.raises(ValueError, match="horizon"):
+        shadow.shadow(**args)
+    assert not (tmp_path / "shadow").exists()

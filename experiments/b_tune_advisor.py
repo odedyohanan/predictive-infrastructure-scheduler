@@ -215,7 +215,7 @@ def summarise(episodes: list[dict], configs: list[dict]) -> dict:
                   "time_advisor": float(t_adv.mean()) if len(calm) else float("nan"),
                   "time_r6": float(t_ref.mean()) if len(calm) else float("nan"),
                   "time_diff": t, "value_diff": v, "value_lo": lo, "r6_value": r6_value,
-                  "value_ok": bool(lo >= -VALUE_TOL * r6_value),
+                  "value_ok": bool(lo >= -VALUE_TOL * abs(r6_value)),
                   "incidents_advisor": int(sum(x["incidents"] for x in adv)),
                   "incidents_r6": int(sum(x["incidents"] for x in ref)),
                   "mode_share": float(np.mean([x["mode_share"] for x in adv])),
@@ -233,8 +233,7 @@ def choose_config(summary: dict) -> str | None:
 
 
 # ------------------------------------------------------------------ note
-def _f(x, fmt="{:.2f}") -> str:
-    return "-" if x is None or (isinstance(x, float) and not math.isfinite(x)) else fmt.format(x)
+_f = partial(runs.fmt, default="{:.2f}")
 
 
 def note_text(cfg: dict, summary: dict, chosen: str | None, timing: dict) -> str:
@@ -247,7 +246,10 @@ def note_text(cfg: dict, summary: dict, chosen: str | None, timing: dict) -> str
          f"{cfg['step_a'].get('change_cost', 0.0)}. World model sha256 {cfg['world_model_sha256']}.", "",
          "Time in incident: mean over the episodes that are not chronic for R6 (more than half the windows in "
          "incident). Value per second: paired over all episodes; a config is admissible when the 95 % lower bound "
-         f"of (advisor - R6) is at least -{VALUE_TOL:.0%} of R6's mean value per second.", "",
+         f"of (advisor - R6) is at least -{VALUE_TOL:.0%} of |R6's mean value per second|.", "",
+         "The incident probability of a candidate is a share of n futures, so a bound eps admits only multiples of "
+         "1/n below it: with n = 8, eps 0.05 and 0.1 both mean no future may show a new incident (p = 0), and so "
+         "does eps 0.05 with n = 16; the grid is kept as tuned.", "",
          "| config | time in incident advisor / R6 (s) | diff [95 % CI] | value diff [95 % CI] | value ok | "
          "incidents advisor / R6 | mode share | fallback share | decide p95 / max ms |",
          "|---|---|---|---|---|---|---|---|---|"]

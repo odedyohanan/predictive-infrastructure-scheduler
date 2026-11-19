@@ -85,3 +85,43 @@ def test_frozen_inputs_of_a_real_run(timing):
     assert timing.frozen_problems(a, cfg, inc, {**alarms, "threshold": 0.5})
     assert timing.frozen_problems(a, {**cfg, "alarms": None}, inc, alarms)
     assert timing.frozen_problems(a, cfg, {**inc, "k": 6}, alarms)
+
+
+def _tune_raw(tmp_path):
+    d = tmp_path / "tune" / "s0000"
+    d.mkdir(parents=True)
+    shares = {3450: 0.1, 3451: 0.4, 3452: 0.0, 3453: 0.4, 3454: 0.3, 3100: 0.9}
+    eps = [{"seed": s, "arm": "eps0.1_n8", "mode_share": m} for s, m in shares.items()]
+    eps += [{"seed": s, "arm": "eps0.2_n8", "mode_share": 1.0} for s in (3450, 3452)]
+    (d / "episodes.json").write_text(json.dumps(eps))
+    (d / "done").write_text("")
+    return tmp_path / "tune"
+
+
+def test_top_mode_seeds(timing, tmp_path):
+    tune = _tune_raw(tmp_path)
+    assert timing.top_mode_seeds(tune, "eps0.1_n8") == [3451, 3453, 3454]       # history seed 3100 ignored
+    assert timing.top_mode_seeds(tune, "eps0.2_n8") == [3450, 3452]
+    assert timing.top_mode_seeds(tune, None) == [] and timing.top_mode_seeds(tmp_path / "none", "x") == []
+
+
+def test_real_run_times_the_seeds_with_the_most_intervention(timing, tmp_path):
+    tune = _tune_raw(tmp_path)
+    (tmp_path / "advisor.json").write_text(json.dumps({"chosen": "eps0.1_n8", "params": {"m": 4}}))
+    with pytest.raises(SystemExit) as e:
+        timing.main(["--config", str(tmp_path / "advisor.json"), "--tune-dir", str(tune), "--seeds", "3450-3452"])
+    assert "refusing" in str(e.value) and "3451" in str(e.value)
+
+
+def test_note_reports_in_mode_p95(timing):
+    per = {3450: {"n": 10, "mode_windows": 2, "fallbacks": 0, "mean": 1.0, "p50": 1.0, "p95": 2.0, "max": 3.0,
+                  "in_mode_p95": 7.5}}
+    res = {"per_seed": per, "all": per[3450], "in_mode": {"n": 2, "p50": 7.0, "p95": 7.5, "max": 8.0},
+           "breakdown": {"risk_ms_mean": 1.0, "risk_ms_p95": 1.0, "select_ms_mean_in_mode": 1.0,
+                         "select_ms_p95_in_mode": 1.0},
+           "wall_s": {3450: 1.0}, "worst_p95": 2.0, "worst_max": 3.0, "p95_ok": True, "max_ok": True,
+           "worst_in_mode_p95": 7.5}
+    text = timing.note_text(res, {"label": "smoke", "seeds": "3450", "duration": 5.0, "config": "c.json",
+                                  "selection": "model"}, {"params": {}}, "x", {})
+    assert "- in-mode p95 (worst episode) 7.5 ms" in text and "| 7.5 |" in text
+    assert "- worst per-episode p95 2.0 ms: within" in text

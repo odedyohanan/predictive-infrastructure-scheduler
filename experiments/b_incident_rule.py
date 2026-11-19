@@ -155,7 +155,9 @@ def note_text(r: dict, limit: float) -> str:
     lines += ["", f"Incidents: {tot}; building-up {tot_b} ({tot_b / tot:.0%} of incidents)" if tot else
               "", f"Chronic episodes: {n_chronic} of {r['episodes']} ({n_chronic / r['episodes']:.0%}).", "",
               f"Raise MAGNITUDES once (fewer than {MIN_BUILDING_UP} building-up incidents): "
-              f"{'YES' if r['raise_magnitudes'] else 'no'} ({r['building_up']} building-up incidents)."]
+              f"{'YES' if r['raise_magnitudes'] else 'no'} ({r['building_up']} building-up incidents).",
+              "", "If the magnitudes are raised, the whole history is regenerated into a new directory with the new "
+              "magnitudes; episodes made with the old ones are never mixed with the new."]
     return "\n".join(lines) + "\n"
 
 

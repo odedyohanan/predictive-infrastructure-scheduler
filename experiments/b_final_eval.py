@@ -39,7 +39,7 @@ are the conformal ones of the shadow run's calibration episodes, never refitted 
 variant (the shadow run's gate stopped before prevention) runs r6 alone and does not attempt question 2.
 
 Guards. A run on any held-out seed uses exactly the protocol's seeds and duration, no label, background
-priority, a clean tree, the protocol at configs/phase_b/final_eval.json with exactly one commit that touches
+priority (read from the process: macOS background QoS as scripts/gentle.sh sets it, or a positive nice value), a clean tree, the protocol at configs/phase_b/final_eval.json with exactly one commit that touches
 only it, the frozen files it names (tracked ones committed at HEAD, all matching their sha256), and the
 official outputs. Attempts are numbered 1..3, each needs the previous attempt's raw directory and the same
 frozen files; an attempt with a report section or a raw directory is refused unless it is resumed (same code
@@ -450,9 +450,9 @@ def check_run(a: dict, protocol: dict, state: dict) -> list[str]:
                           f"{protocol['seeds']['first']}-{protocol['seeds']['last']}")
         if a["label"]:
             errors.append("a run on the held-out seeds takes no label")
-        if a.get("priority", "background") != "background":
-            errors.append("a run on the held-out seeds is launched through scripts/gentle.sh "
-                          "(--priority background)")
+        if not state.get("background"):
+            errors.append("a run on the held-out seeds runs at background priority: launch it through "
+                          f"scripts/gentle.sh (this process: {state.get('priority', 'unknown')})")
         if a["duration"] != protocol["duration_s"]:
             errors.append(f"duration differs from the protocol's {protocol['duration_s']:g} s")
         if state["dirty"]:
@@ -857,8 +857,7 @@ def question_one(risks: dict, labels: dict, active: dict, names, calibration, he
 
 
 # ------------------------------------------------------------------ report
-def _f(x, fmt="{:.2f}") -> str:
-    return "-" if x is None or (isinstance(x, float) and not math.isfinite(x)) else fmt.format(x)
+_f = partial(runs.fmt, default="{:.2f}")
 
 
 def _ci(d: dict, fmt="{:+.2f}") -> str:
@@ -1050,7 +1049,6 @@ def main(argv=None):
     ap.add_argument("--resume", action="store_true", help="continue an interrupted attempt")
     ap.add_argument("--procs", type=int, default=4)
     ap.add_argument("--label", default="", help='"rehearsal" or "smoke" for development-seed runs')
-    ap.add_argument("--priority", choices=("background", "normal"), default="background")
     ap.add_argument("--out", default=OFFICIAL_REPORT)
     ap.add_argument("--raw-dir", default=OFFICIAL_RAW)
     a = ap.parse_args(argv)
@@ -1084,8 +1082,9 @@ def main(argv=None):
              "report_text": out.read_text() if out.is_file() else "", "out_exists": out.exists(),
              "raw_exists": raw_attempt.exists(), "prev_raw_exists": (raw_root / f"attempt_{a.attempt - 1}").is_dir(),
              "freeze": freeze_state(), "run_config": run_config, "code_changed": code_changed(run_config)}
+    state["background"], state["priority"] = runs.background_priority()
     args = {"seeds_list": seeds, "label": a.label, "duration": duration, "out": a.out, "raw_dir": a.raw_dir,
-            "attempt": a.attempt, "resume": a.resume, "priority": a.priority, "protocol": a.protocol}
+            "attempt": a.attempt, "resume": a.resume, "protocol": a.protocol}
     errors = check_run(args, protocol, state)
     if errors:
         raise SystemExit("refusing to run: " + "; ".join(errors))
@@ -1156,7 +1155,7 @@ def main(argv=None):
                   "protocol": {"path": safe_path(a.protocol), "sha256": pinned["protocol_sha256"],
                                "freeze_commit": freeze, "variant": protocol["variant"]},
                   "pinned": pinned, "arms": arms, "n_seeds": len(seeds),
-                  "seeds": seed_text, "duration_s": duration, "procs": a.procs, "priority": a.priority,
+                  "seeds": seed_text, "duration_s": duration, "procs": a.procs, "priority": state["priority"],
                   "versions": {"python": platform.python_version(), "numpy": np.__version__,
                                "torch": torch.__version__},
                   "start_utc": now}
@@ -1267,7 +1266,7 @@ def main(argv=None):
     config.update(end_utc=time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
                   runs_ok=sum(not e.get("failed") for e in episodes), runs_failed=len(q2["failed"]))
     (raw_attempt / "run_config.json").write_text(scrub(json.dumps(config, indent=1)) + "\n")
-    meta["runtime"] = (f"{config['runtime_s']} s with {a.procs} process(es) ({a.priority} priority); seconds per "
+    meta["runtime"] = (f"{config['runtime_s']} s with {a.procs} process(es) ({state['priority']}); seconds per "
                        "episode by arm (mean): " + ", ".join(f"{k} {_f(v, '{:.1f}')}" for k, v in
                                                             proj["per_arm_s"].items())
                        + f"; predictor scoring {_f(proj['scoring_s'], '{:.1f}')} s per R6 episode")

@@ -112,7 +112,7 @@ def test_validate_protocol(fe, tmp_path):
 # ------------------------------------------------------------------ guards
 def _official_args(fe, **kw):
     base = {"seeds_list": list(range(3000, 3100)), "label": "", "duration": 300.0, "out": fe.OFFICIAL_REPORT,
-            "raw_dir": fe.OFFICIAL_RAW, "attempt": 1, "resume": False, "priority": "background",
+            "raw_dir": fe.OFFICIAL_RAW, "attempt": 1, "resume": False,
             "protocol": fe.PROTOCOL}
     return {**base, **kw}
 
@@ -121,7 +121,7 @@ def _state(**kw):
     base = {"dirty": False, "committed": {"configs/phase_b/final_eval.json": True}, "sha_mismatch": [],
             "report_text": "", "out_exists": False, "raw_exists": False, "prev_raw_exists": False,
             "freeze": {"commits": ["abc"], "files": ["configs/phase_b/final_eval.json"]},
-            "run_config": None, "code_changed": False}
+            "run_config": None, "code_changed": False, "background": True, "priority": "nice 10"}
     return {**base, **kw}
 
 
@@ -144,7 +144,7 @@ def test_official_run_accepted_when_everything_is_in_place(fe, official_protocol
     ({"seeds_list": list(range(3000, 3100)) + [3000]}, {}, "exactly"),
     ({"label": "rehearsal"}, {}, "label"),
     ({"duration": 30.0}, {}, "duration"),
-    ({"priority": "normal"}, {}, "gentle"),
+    ({}, {"background": False}, "gentle"),
     ({}, {"committed": {"configs/phase_b/final_eval.json": False}}, "committed"),
     ({}, {"sha_mismatch": ["alarms"]}, "sha256"),
     ({}, {"freeze": {"commits": ["a", "b"], "files": ["configs/phase_b/final_eval.json"]}}, "one commit"),
@@ -185,7 +185,7 @@ def test_resume(fe, official_protocol):
 def _rehearsal_args(fe, tmp_path, **kw):
     base = {"seeds_list": [3450, 3451, 3452], "label": "rehearsal", "duration": 30.0,
             "out": str(tmp_path / "final.md"), "raw_dir": str(tmp_path / "raw"), "attempt": 1, "resume": False,
-            "priority": "background", "protocol": str(tmp_path / "p.json")}
+            "protocol": str(tmp_path / "p.json")}
     return {**base, **kw}
 
 
@@ -660,3 +660,23 @@ def test_code_drift(tmp_path):
     from pis.phase_b import runs
     assert shadow.code_drift({"code_head": runs.git_head()}) is None
     assert shadow.code_drift({"code_head": "aa71319"})                       # pis/phase_b changed since then
+
+
+def test_background_priority_is_read_from_the_process(monkeypatch):
+    import os
+    from pis.phase_b import runs
+
+    def prio(nice, darwin):
+        def get(which, who):
+            if which == runs.PRIO_DARWIN_PROCESS:
+                if darwin is None:
+                    raise OSError("not macOS")
+                return darwin
+            return nice
+        return get
+    monkeypatch.setattr(os, "getpriority", prio(0, 0))
+    assert runs.background_priority() == (False, "nice 0")
+    monkeypatch.setattr(os, "getpriority", prio(0, 1))
+    assert runs.background_priority() == (True, "macOS background QoS")
+    monkeypatch.setattr(os, "getpriority", prio(5, None))
+    assert runs.background_priority() == (True, "nice 5")

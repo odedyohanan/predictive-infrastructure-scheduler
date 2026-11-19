@@ -160,6 +160,7 @@ def test_analyse_synthetic_history(tmp_path):
     assert r["building_up"] == 2 and r["raise_magnitudes"]
     text = rule.note_text(r, 0.05)
     assert "k = 3" in text and "YES" in text
+    assert "regenerated into a new directory" in text and "never mixed" in text
 
 
 def test_analyse_adds_intervention_episodes_when_few(tmp_path):
