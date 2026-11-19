@@ -1,0 +1,72 @@
+"""Guards shared by the incident-advisor experiment scripts: clean tree, seed ranges, smoke output places."""
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+
+from pis.phase_b import seeds as seed_ranges
+from pis.privacy import scrub
+
+ROOT = Path(__file__).resolve().parents[2]
+SMOKE_PREFIX = "data/phase_b/smoke"     # smoke outputs live in directories starting with this
+LABELS = ("", "smoke")
+
+
+def tree_dirty(ignore=()) -> bool:
+    """Uncommitted changes (untracked files included), except the paths in `ignore` (repo-relative)."""
+    p = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=all"],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        return True
+    skip = {str(Path(i)) for i in ignore}
+    return any(line[3:].strip().strip('"') not in skip for line in p.stdout.splitlines() if line.strip())
+
+
+def check_seeds(seeds, allowed: tuple[str, ...]) -> None:
+    """Every seed must lie in one of the named ranges (and none may be refused)."""
+    seeds = list(seeds)
+    if not seeds:
+        raise ValueError("no seeds given")
+    for s in seeds:
+        for name in allowed:
+            if s in seed_ranges.RANGES[name]:
+                seed_ranges.check([s], name)
+                break
+        else:
+            seed_ranges.check([s], allowed[0])      # raises with the reason
+
+
+def smoke_dir(path: str | None) -> Path:
+    """The directory a smoke run writes everything into: required, and under data/phase_b/smoke*."""
+    if not path:
+        raise ValueError("a smoke run needs --smoke-dir (a directory under data/phase_b/smoke*)")
+    p = Path(path).resolve()
+    try:
+        rel = p.relative_to(ROOT.resolve())
+    except ValueError:
+        rel = None
+    if rel is None:
+        # data/phase_b may be a link: compare against its resolved form too
+        base = (ROOT / "data" / "phase_b").resolve()
+        try:
+            rel = Path("data/phase_b") / p.relative_to(base)
+        except ValueError:
+            raise ValueError("--smoke-dir must lie under data/phase_b/smoke*") from None
+    if not str(rel).startswith(SMOKE_PREFIX):
+        raise ValueError("--smoke-dir must lie under data/phase_b/smoke*")
+    return p
+
+
+def write_note(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(scrub(text))
+
+
+def read_json(path: Path) -> dict:
+    return json.loads(Path(path).read_text()) if Path(path).exists() else {}
+
+
+def write_json(path: Path, obj: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n")
