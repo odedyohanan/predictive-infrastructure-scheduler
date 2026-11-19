@@ -2,14 +2,15 @@
 policies are compared by sampled world-model futures under a chance constraint on a new incident.
 
 Every window the advisor appends the telemetry it sees (never the degradation block) and the policy in
-force to its own history, builds predictor rows from it (`features.rows_from_records`) and asks the
+force, masked for the dead CPUs and GPUs the telemetry's "hardware" block reports (as the simulator ran it
+and the store records it), to its own history, builds predictor rows from it (`features.rows_from_records`) and asks the
 predictor for the risk of a new incident within H (from the warm-up on; before it there is no risk). The
 intervention mode turns on when the risk reaches the alarm threshold and stays on until the risk falls
 below `low` (the alarm's hysteresis). Outside the mode the advisor returns R6's greedy decision unchanged.
 
 In the mode the candidates are R6's greedy decision, `m` R6 samples and the "after" policies of the named
 interventions that differ from the policy in force, de-duplicated (first occurrence kept, greedy first).
-Each candidate is held for h windows in `n` sampled futures (all candidates in one batch). Its value is the
+Each candidate, masked for the dead hardware, is held for h windows in `n` sampled futures (all candidates in one batch). Its value is the
 Phase A reward of the predicted states (the 39 world-model numbers; `slo_lam`, `mu`; no disagreement term;
 `change_cost` when it differs from the policy in force), averaged over windows and futures; its incident
 probability is the share of futures with a new counted onset in (t, t + h], judged on the observed
@@ -42,6 +43,7 @@ from pis.candidates import is_valid, policy_key
 from pis.config import setup_imports
 from pis.evaluator import change_penalty, predicted_rewards
 from pis.phase_b import features, incidents
+from pis.phase_b.scenarios import mask_policy
 from pis.probe import named_interventions
 
 setup_imports()
@@ -60,6 +62,16 @@ CVAR_LEVEL = 0.10
 TIE = 1e-9
 BOUND_TOL = 1e-6
 N_WM = 39                   # the world-model state numbers lead the 43-number state
+N_CPUS, N_GPUS = 8, 2
+
+
+def dead_hardware(tel: dict) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Dead CPUs and GPUs from the telemetry's visible "hardware" block (none when it is absent)."""
+    hw = tel.get("hardware")
+    if not hw:
+        return (), ()
+    return (tuple(k for k in range(N_CPUS) if k not in hw["alive_cpus"]),
+            tuple(g for g in range(N_GPUS) if g not in hw["alive_gpus"]))
 
 
 @dataclass(frozen=True)
@@ -198,6 +210,7 @@ class AdvisorController:
         cap = int(round((duration_s or 300.0) / spec.policy_period_s))
         self.rows = _Rows(self.known, self.seed, cap)
         self.mode = False
+        self.dead: tuple = ((), ())
         self.sim = self.dsim = None
         self.last: dict = {}
 
@@ -261,7 +274,8 @@ class AdvisorController:
         t = self.rows.n - 1
         m = p.h + self.rule.k - 1
         roll = self.model.sample_rollouts_batch(self.rows.window(self.model.context),
-                                                [encode_policy(c) for c in cands], self.known, m, p.n,
+                                                [encode_policy(mask_policy(c, *self.dead)) for c in cands],
+                                                self.known, m, p.n,
                                                 seed=ROLL_TAG + self.seed * 1000 + t)
         mean, total = score_rollouts(self.spec, roll, p.h, p.slo_lam, p.mu,
                                      change_penalty(cands, current, p.change_cost))
@@ -302,7 +316,8 @@ class AdvisorController:
     # ------------------------------------------------------------------ controller protocol
     def decide(self, tel: dict, current: dict, history) -> tuple[dict, dict]:
         t0 = time.perf_counter()
-        self.rows.append(tel, current)
+        self.dead = dead_hardware(tel)
+        self.rows.append(tel, mask_policy(current, *self.dead))
         risk = self._risk()
         t_risk = time.perf_counter()
         self.mode = self._update_mode(risk)

@@ -45,7 +45,7 @@ class StubModel:
 
     def sample_rollouts_batch(self, history, policies, known, horizon, n, seed=None):
         self.calls.append({"k": len(policies), "horizon": horizon, "n": n, "seed": seed,
-                           "history": len(history.states)})
+                           "history": len(history.states), "policies": [np.array(p) for p in policies]})
         out = np.zeros((len(policies), n, horizon, features.N_STATE), np.float32)
         for i in range(len(policies)):
             for j, (b, v) in enumerate(self.fn(i, n)):
@@ -271,3 +271,25 @@ def test_params_from_step_a():
                                           H=30, n=8, eps=0.05)
     assert (p.m, p.n, p.h, p.eps, p.mu, p.slo_lam) == (4, 8, 20, 0.05, 8.0, 40.0)
     assert advisor.AdvisorParams.from_step_a({"mu": 1, "slo_lam": 2, "change_cost": 0}, H=12).h == 12
+
+
+# ------------------------------------------------------------------ dead hardware
+def test_advisor_history_and_candidates_use_the_masked_policy():
+    from worldmodel.features import encode_policy
+    sc = _scenario(5.0, kind="cpu_loss")               # CPUs 2, 3 die at 1 s
+    model = StubModel(lambda i, n: [(1.0, False)] * n)
+    ctl = _ctrl(sc, [0.9], model=model)
+    recs = run_episode(sc, ctl, "advisor")
+    np.testing.assert_array_equal(np.stack(ctl.rows.policies), features.encode_records(recs, ctl.known).policies)
+    store_like = features.rows_from_records(recs, ctl.known, episode=sc.seed)
+    mine = ctl.rows.frame()
+    for c in features.POLICY_COLS:
+        np.testing.assert_array_equal(mine[c].to_numpy(), store_like[c].to_numpy())
+    dead = [k for k in range(8) if k not in recs[-1]["tel"]["hardware"]["alive_cpus"]]
+    assert dead == [2, 3]
+    sent = model.calls[-1]["policies"]
+    want = [encode_policy(scenarios.mask_policy(c, dead, ())) for c in ctl.last["candidates"]]
+    assert len(sent) == len(want)
+    for a, b in zip(sent, want):
+        np.testing.assert_array_equal(a, b)
+    assert any(not np.array_equal(encode_policy(c), w) for c, w in zip(ctl.last["candidates"], want))

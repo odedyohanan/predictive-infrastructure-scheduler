@@ -16,7 +16,8 @@ def run_episode(scenario: Scenario, controller: Controller, policy_source: str,
     `on_window(dsim, record)` is called after each record, with the simulator at the window's end.
     Controllers with `attach_sim` get the underlying simulator, and those with `attach_dsim` the
     `DegradedSim` around it (to branch the real system with its degradation schedule). Controllers never see the
-    "phase_b" block of the telemetry (the degradation is not announced); records keep it.
+    "phase_b" block of the telemetry (the degradation is not announced); records keep it. Dead hardware is
+    observable: the visible "hardware" block (alive CPUs and GPUs) reaches controllers.
     """
     ds = DegradedSim(scenario)
     if hasattr(controller, "attach_sim"):

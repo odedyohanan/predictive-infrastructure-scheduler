@@ -38,7 +38,7 @@ def _policies(n):
 
 
 def _strip(tel):
-    return {k: v for k, v in tel.items() if k != "phase_b"}
+    return {k: v for k, v in tel.items() if k not in ("phase_b", "hardware")}
 
 
 class Fixed:
@@ -80,6 +80,7 @@ def test_no_degradation_is_identical():
         assert _strip(a) == b
         assert a["phase_b"] == {"kind": "none", "active": False, "factor": 0.0,
                                 "alive_cpus": list(range(8))}
+        assert a["hardware"] == {"alive_cpus": list(range(8)), "alive_gpus": [0, 1]}
     assert ds.sim.spec is sc.spec
     assert ds.done() and plain.done()
 
@@ -284,6 +285,49 @@ def test_run_episode_attaches_degraded_sim():
     assert ctl.dsims[0].scenario is sc and ctl.dsims[0].done()
     plain = run_episode(sc, Fixed(pol), "fixed")             # behaviour without the hook is unchanged
     assert [r["tel"] for r in plain] == [r["tel"] for r in recs]
+
+
+@pytest.mark.parametrize("kind, cpus, gpus", [("cpu_loss", [0, 1, 4, 5, 6, 7], [0, 1]),
+                                               ("gpu_loss", list(range(8)), [1])])
+def test_hardware_visible_to_controllers(kind, cpus, gpus):
+    sc = _scenario(kind, onset=2.0, duration=4.0)
+    ctl = Fixed(adapters.initial_policy())
+    recs = run_episode(sc, ctl, "fixed")
+    for seen, r in zip(ctl.seen, recs):
+        assert "phase_b" not in seen                             # drift stays hidden
+        dead = r["tel"]["phase_b"]["active"]
+        assert seen["hardware"] == ({"alive_cpus": cpus, "alive_gpus": gpus} if dead
+                                    else {"alive_cpus": list(range(8)), "alive_gpus": [0, 1]})
+    assert any(r["tel"]["phase_b"]["active"] for r in recs) and not recs[0]["tel"]["phase_b"]["active"]
+
+
+class _Unaware:
+    """R6 fed telemetry without the hardware key."""
+    def __init__(self, spec):
+        from pis.harness import BaseGreedyController
+        self.inner = BaseGreedyController(spec)
+
+    def decide(self, tel, current, history):
+        return self.inner.decide(_strip(tel), current, [(_strip(t), p) for t, p in history])
+
+
+def test_hardware_key_does_not_change_r6():
+    from pis.harness import BaseGreedyController
+    sc = _scenario("cpu_loss", onset=2.0, duration=6.0)
+    a = run_episode(sc, BaseGreedyController(sc.spec), "r6")
+    b = run_episode(sc, _Unaware(sc.spec), "r6")
+    assert [r["policy"] for r in a] == [r["policy"] for r in b]
+    assert [_strip(r["tel"]) for r in a] == [_strip(r["tel"]) for r in b]
+
+
+def test_hardware_key_leaves_features_and_store_rows():
+    from pis.phase_b import features, history
+    sc = _scenario("cpu_loss", onset=2.0, duration=4.0)
+    recs = run_episode(sc, Fixed(adapters.initial_policy()), "fixed")
+    bare = [{**r, "tel": {k: v for k, v in r["tel"].items() if k != "hardware"}} for r in recs]
+    k = adapters.known_of(sc.spec)
+    np.testing.assert_array_equal(features.encode_records(recs, k).states, features.encode_records(bare, k).states)
+    assert history.window_frame(sc, recs, "fixed").equals(history.window_frame(sc, bare, "fixed"))
 
 
 def _mid_burst_sim():
