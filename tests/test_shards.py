@@ -1,8 +1,10 @@
 import json
+import os
 
 import pytest
 
 from pis import shards
+
 
 def write_items(shard, out):
     """Shard function used by the tests (top level, so spawned workers can import it)."""
@@ -89,3 +91,27 @@ def test_duplicate_shard_ids_refused(tmp_path):
 
 def test_collect_on_missing_dir(tmp_path):
     assert shards.collect(tmp_path / "nothing") == []
+
+
+def die_on_99(shard, out):
+    """Kills its worker process outright (as an OOM kill or a signal would)."""
+    if 99 in shard.items:
+        os._exit(1)
+    (out / "items.json").write_text(json.dumps(shard.items))
+
+
+def test_dead_worker_fails_only_its_shard(tmp_path):
+    sh = shards.make_shards([0, 2, 99, 4, 6], 1)
+    res = shards.run_shards(tmp_path, sh, die_on_99, CONFIG, procs=2)
+    dead = sh[2].id
+    assert res["failed"] == [dead]
+    assert sorted(res["done"]) == sorted(s.id for s in sh if s.id != dead)
+    assert not (tmp_path / dead / "done").exists()
+    res2 = shards.run_shards(tmp_path, sh, write_items, CONFIG, procs=2)
+    assert res2["done"] == [dead] and len(res2["skipped"]) == 4
+
+
+@pytest.mark.parametrize("bad", ["", "a/b", "..", "a..b", "x y", "/abs"])
+def test_bad_shard_ids_refused(bad):
+    with pytest.raises(ValueError):
+        shards.Shard(bad, [1])

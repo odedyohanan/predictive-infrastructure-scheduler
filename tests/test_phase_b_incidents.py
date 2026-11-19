@@ -146,16 +146,18 @@ def test_label_real_episode():
 
     from pis.adapters import initial_policy
     from pis.phase_b.episode import run_episode
-    from pis.phase_b.scenarios import MAGNITUDES, Degradation, scenario_for
+    from pis.phase_b.scenarios import Degradation, scenario_for
 
     class Fixed:
         def decide(self, tel, current, history):
             return initial_policy(), {"decide_ms": 0.0}
 
+    # service time x5 from 2 s on: far beyond A's four CPUs, so an incident is certain
     sc = dataclasses.replace(scenario_for(3101), duration_s=10.0,
-                             degradation=Degradation("leak", 2.0, 2.0, MAGNITUDES["leak"]))
+                             degradation=Degradation("leak", 2.0, 0.5, 4.0))
     recs = run_episode(sc, Fixed(), "fixed")
-    lab = incidents.label(recs, RULE, warmup=2)
+    lab = incidents.label(recs, RULE, warmup=4)            # window 4 is the first degraded one
     assert lab.in_incident.shape == (20,)
     assert len(incidents.early_signal(recs)) == 20
-    assert all(i.cause == "building_up" for i in lab.incidents if i.onset >= 4)
+    assert lab.incidents
+    assert all(i.cause == "building_up" for i in lab.incidents)

@@ -1,15 +1,20 @@
 """Resumable sharded runs: each shard writes its own directory and a `done` marker last.
 
 Rerunning skips finished shards and redoes the rest from scratch; a changed configuration is
-refused instead of being mixed with shards produced under the old one.
+refused instead of being mixed with shards produced under the old one. `config.json` is pinned by the
+first run of a directory, even if that run crashes: a different configuration needs a new directory.
+A worker killed outright (out of memory, a signal) fails only its own shard; the run still returns.
 """
 from __future__ import annotations
 
 import json
 import logging
 import multiprocessing as mp
+import re
 import shutil
 import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -20,12 +25,17 @@ log = logging.getLogger(__name__)
 DONE = "done"
 CONFIG_FILE = "config.json"
 ERROR_FILE = "error.txt"
+ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 @dataclass
 class Shard:
     id: str
     items: list
+
+    def __post_init__(self):
+        if not ID_PATTERN.match(self.id) or ".." in self.id:
+            raise ValueError(f"bad shard id {self.id!r}: letters, digits, '_', '.', '-' only, no '..'")
 
 
 def make_shards(items, size: int) -> list[Shard]:
@@ -79,8 +89,12 @@ def run_shards(out_dir: Path, shards: list[Shard], fn: Callable[[Shard, Path], N
     skipped = [s.id for s in shards if (out_dir / s.id / DONE).exists()]
     todo = [(s, out_dir, fn) for s in shards if s.id not in skipped]
     if procs > 1 and len(todo) > 1:
-        with mp.get_context("spawn").Pool(min(procs, len(todo))) as pool:
-            results = list(pool.imap_unordered(_run_one, todo))
+        results, broken = _pool(todo, procs)
+        # A dead worker breaks the whole pool and fails every unfinished shard with it; run those
+        # again one per fresh single-worker pool so only the shard that kills its worker fails.
+        for job in broken:
+            more, again = _pool([job], 1)
+            results += more + [(j[0].id, False, "worker process died") for j in again]
     else:
         results = [_run_one(j) for j in todo]
     done, failed = [], []
@@ -91,6 +105,19 @@ def run_shards(out_dir: Path, shards: list[Shard], fn: Callable[[Shard, Path], N
             failed.append(sid)
             log.error("shard %s failed:\n%s", sid, msg)
     return {"done": done, "skipped": skipped, "failed": failed}
+
+
+def _pool(jobs: list, procs: int) -> tuple[list, list]:
+    """Results of the jobs that finished, and the jobs lost to a dead worker."""
+    results, broken = [], []
+    with ProcessPoolExecutor(min(procs, len(jobs)), mp_context=mp.get_context("spawn")) as ex:
+        futures = {ex.submit(_run_one, j): j for j in jobs}
+        for fut in as_completed(futures):
+            try:
+                results.append(fut.result())
+            except BrokenProcessPool:
+                broken.append(futures[fut])
+    return results, broken
 
 
 def collect(out_dir: Path) -> list[Path]:
