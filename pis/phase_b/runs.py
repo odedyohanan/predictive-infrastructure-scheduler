@@ -23,6 +23,12 @@ def tree_dirty(ignore=()) -> bool:
     return any(line[3:].strip().strip('"') not in skip for line in p.stdout.splitlines() if line.strip())
 
 
+def git_head() -> str:
+    """The commit of the working tree (git rev-parse HEAD), "unknown" outside a repository."""
+    p = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True)
+    return p.stdout.strip() or "unknown"
+
+
 def check_seeds(seeds, allowed: tuple[str, ...]) -> None:
     """Every seed must lie in one of the named ranges (and none may be refused)."""
     seeds = list(seeds)

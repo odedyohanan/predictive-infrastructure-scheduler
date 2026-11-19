@@ -290,6 +290,8 @@ def test_shadow_end_to_end(shadow, tmp_path):
                 out=tmp_path / "shadow", note=tmp_path / "note.md", alarms_path=tmp_path / "alarms.json",
                 procs=1, label="smoke", overrides={"analogue": {"k": 5}, "hazard": {"iters": 50}})
     res = shadow.shadow(**args)
+    from pis.phase_b import runs
+    assert json.loads((tmp_path / "shadow" / "config.json").read_text())["code_head"] == runs.git_head()
     raw = pd.concat([pd.read_parquet(p) for p in (tmp_path / "shadow").glob("s*/risks.parquet")])
     assert set(raw.episode) == set(range(3400, 3420)) | set(range(3450, 3456))
     assert raw[raw.window < 20][list(shadow.ALL)].isna().all().all()

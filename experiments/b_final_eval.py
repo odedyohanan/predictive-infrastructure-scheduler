@@ -44,7 +44,9 @@ only it, the frozen files it names (tracked ones committed at HEAD, all matching
 official outputs. Attempts are numbered 1..3, each needs the previous attempt's raw directory and the same
 frozen files; an attempt with a report section or a raw directory is refused unless it is resumed (same code
 since it started). Other runs use SELECTION seeds only, label "rehearsal" or "smoke", and outputs outside
-results/phase_b/final.md and results/raw/phase_b/final. Outputs: one "## Attempt N" section in
+results/phase_b/final.md and results/raw/phase_b/final. Before any simulation the current code must reproduce
+the shadow run's risks of two calibration episodes re-scored from the store (an official run refuses
+otherwise, naming the predictors; a pis/phase_b diff since the shadow run's commit is a warning). Outputs: one "## Attempt N" section in
 results/phase_b/final.md, appended as a "(started)" stub before any simulation and replaced at the end; raw
 shards under results/raw/phase_b/final/attempt_N/ (git-ignored).
 """
@@ -1112,6 +1114,11 @@ def main(argv=None):
         if thr is None or alarms.get("threshold") is None or abs(thr - float(alarms["threshold"])) > 1e-12:
             problems.append(f"the calibration threshold of {alarms['predictor']} ({thr}) differs from the alarms "
                             f"config's ({alarms.get('threshold')})")
+    refusals, drift = runs.load_script("b_shadow").identity_check(_abs(files["shadow_risks"]["path"]),
+                                                                  _abs(files["world_model"]["path"]))
+    problems += refusals
+    for w in drift:
+        print(f"warning: {w}", flush=True)
     from pis.config import sibling_paths
     pa = load_json(files["phase_a_protocol"]["path"])["arms"]["base_r6"]
     ckpt = sibling_paths()["sched"] / pa["checkpoint"]
@@ -1119,6 +1126,7 @@ def main(argv=None):
         raise SystemExit("refusing to run: the R6 checkpoint differs from the Phase A protocol's")
     if official and problems:
         raise SystemExit(scrub("refusing to run: " + "; ".join(problems)))
+    problems += drift                           # warnings only
     pinned = {"protocol_sha256": _sha256(_abs(a.protocol)), "files": {k: v["sha256"] for k, v in files.items() if v}}
     prev = raw_root / f"attempt_{a.attempt - 1}"
     if official and a.attempt > 1 and not a.resume:

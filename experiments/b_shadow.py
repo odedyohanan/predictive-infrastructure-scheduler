@@ -176,6 +176,75 @@ def run_shard(shard, shard_dir: Path, params: dict) -> None:
     (shard_dir / TIMING_FILE).write_text(json.dumps({"seconds": seconds, "windows": windows}))
 
 
+# ------------------------------------------------------------------ code identity
+def stored_risks(shadow_dir: Path, episodes, names) -> dict:
+    """{episode: {name: risk series}} of a shadow run's finished shards."""
+    import pandas as pd
+    from pis.shards import collect
+    want = {int(e) for e in episodes}
+    raw = pd.concat([pd.read_parquet(d / RISKS_FILE) for d in collect(shadow_dir)], ignore_index=True)
+    raw = raw[raw.episode.isin(want)]
+    return {int(e): {n: g.sort_values("window")[n].to_numpy(float) for n in names} for e, g in raw.groupby("episode")}
+
+
+def rescore_check(shadow_dir, world_model, episodes: int = 2, windows: int | None = None) -> list[str]:
+    """Predictors whose risks, recomputed now from the store on the shadow run's first `episodes` calibration
+    episodes (the first `windows` windows; all by default), differ from its stored risks by more than 1e-9
+    (NaN where it had NaN). Empty when the current code reproduces the shadow run."""
+    from pis.phase_b import features
+    from pis.phase_b.history import Store
+    shadow_dir = Path(shadow_dir)
+    cfg = runs.read_json(shadow_dir / "config.json")
+    if not cfg:
+        raise ValueError("the shadow run has no config.json")
+    names, rule = list(cfg["names"]), cfg["rule"]
+    chosen = [int(e) for e in cfg["calibration"][:episodes]]
+    store_path = Path(cfg["store"])
+    st = Store(store_path if store_path.is_absolute() else ROOT / store_path)
+    eps = st.episodes().set_index("seed")
+    preds = load_predictors(shadow_dir / FITTED_FILE if any(n != "world_model" for n in names) else None, names,
+                            rule, world_model, int(cfg["wm_n"]))
+    old = stored_risks(shadow_dir, chosen, names)
+    bad = set()
+    for e in chosen:
+        T = int(eps.loc[e, "windows"]) if windows is None else min(int(windows), int(eps.loc[e, "windows"]))
+        rows = features.join_known(st.window_rows(e, 0, T), eps.reset_index())
+        now = episode_risks(preds, names, rows, int(rule["H"]), int(rule["warmup"]), e)
+        for n in names:
+            if e not in old or not np.allclose(now[n], old[e][n][:T], rtol=0, atol=1e-9, equal_nan=True):
+                bad.add(n)
+    return sorted(bad)
+
+
+def code_drift(shadow_cfg: dict) -> str | None:
+    """A warning when pis/phase_b changed between the shadow run's commit and HEAD (None when not)."""
+    import subprocess
+    head = shadow_cfg.get("code_head")
+    if not head:
+        return "the shadow run recorded no code commit"
+    p = subprocess.run(["git", "-C", str(ROOT), "diff", "--quiet", head.split("+")[0], "HEAD", "--", "pis/phase_b"],
+                       capture_output=True, text=True)
+    return None if p.returncode == 0 else f"pis/phase_b changed since the shadow run's commit {head[:12]}"
+
+
+def identity_check(shadow_dir, world_model, episodes: int = 2, windows: int | None = None) -> tuple[list, list]:
+    """(refusals, warnings) on whether the current code is the code of the shadow run: its risks re-scored
+    (`rescore_check`) and the pis/phase_b diff since its commit (`code_drift`)."""
+    from pis.privacy import scrub
+    refusals, warnings = [], []
+    try:
+        bad = rescore_check(shadow_dir, world_model, episodes, windows)
+        if bad:
+            refusals.append("the current code does not reproduce the shadow run's risks of " + ", ".join(bad)
+                            + " (calibration episodes re-scored from the store)")
+    except Exception as e:                      # any failure to re-score is a refusal, with its reason
+        refusals.append(scrub(f"the shadow run's risks could not be re-scored: {type(e).__name__}: {e}"))
+    drift = code_drift(runs.read_json(Path(shadow_dir) / "config.json"))
+    if drift:
+        warnings.append(drift)
+    return refusals, warnings
+
+
 # ------------------------------------------------------------------ scoring
 def _recall(res: dict, name: str, cause: str = "building_up") -> float:
     r = res[name]["selection"]["by_cause"][cause]["recall"]
@@ -390,6 +459,8 @@ def shadow(store, rule: dict, names, fit_seeds, calibration, selection, world_mo
     cfg = {"label": label, "store": str(store_path), "rule": rule, "names": names, "fit_seeds": list(fit_seeds),
            "calibration": calibration, "selection": selection, "world_model_sha256": wm_sha, "wm_n": wm_n,
            "overrides": overrides or {}, "shard_size": SHARD_SIZE, "wm_tag": WM_TAG}
+    # the code the risks come from: the commit of the run that started this directory
+    cfg["code_head"] = runs.read_json(out / "config.json").get("code_head") or runs.git_head()
     out.mkdir(parents=True, exist_ok=True)
     _check_config(out, cfg)
     fitted = out / FITTED_FILE

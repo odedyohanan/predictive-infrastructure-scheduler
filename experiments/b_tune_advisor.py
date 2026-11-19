@@ -22,7 +22,8 @@ value per second; ties -> smaller n, then smaller eps. Shards of SHARD_SIZE seed
 (pairing stays inside a shard); rerunning skips finished shards and refuses a changed configuration.
 
 Real runs: all SELECTION seeds, 300 s, a clean tree, configs/phase_b/{incident,alarms}.json with a predictor
-and threshold, the shadow run's predictors; writes configs/phase_b/advisor.json and
+and threshold, the shadow run's predictors, and the current code reproducing the shadow run's risks on two
+calibration episodes (re-scored from the store; a pis/phase_b diff since its commit is a warning); writes configs/phase_b/advisor.json and
 results/phase_b/advisor_dev.md, raw output under results/raw/phase_b/advisor_tune/. Smoke runs (`--label
 smoke`) may use history seeds and a shorter `--duration`, allow a dirty tree and write only into
 `--smoke-dir`. Long runs go through scripts/gentle.sh.
@@ -385,6 +386,12 @@ def main(argv=None) -> dict:
         wm_n = shadow_wm_n(a.fitted, wm_sha, a.wm_n, smoke)
     except ValueError as e:
         raise SystemExit(f"refusing to run: {e}")
+    if not smoke:
+        refusals, warnings = runs.load_script("b_shadow").identity_check(Path(a.fitted).parent, a.world_model)
+        for w in warnings:
+            print(f"warning: {w}", flush=True)
+        if refusals:
+            raise SystemExit("refusing to run: " + "; ".join(refusals))
     out = (sdir / "advisor_tune") if smoke else ROOT / DEFAULT_OUT
     note = (sdir / "advisor_dev.md") if smoke else ROOT / NOTE
     config = (sdir / "advisor.json") if smoke else ROOT / CONFIG

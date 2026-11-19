@@ -619,3 +619,44 @@ def test_oracle_projection_from_tuning_raw(fe, tmp_path):
     assert proj["one_proc_h"] == pytest.approx(100 * want_s / 3600)
     assert proj["four_procs_h"] == pytest.approx(proj["one_proc_h"] / 4)
     assert fe.oracle_projection(tmp_path / "none", adv, RULE, 4, 20) is None
+
+
+# ------------------------------------------------------------------ code identity with the shadow run
+SMOKE_SHADOW = "data/phase_b/smoke_g5/shadow"
+
+
+def _smoke_shadow():
+    from tests._load import ROOT
+    return ROOT / SMOKE_SHADOW, ROOT / PROBE_STORE, ROOT / PROBE_WM
+
+
+@pytest.mark.skipif(not all(p.exists() for p in _smoke_shadow()), reason="smoke shadow run not present")
+def test_rescore_check_reproduces_and_names_a_changed_predictor(tmp_path):
+    import shutil
+    import pandas as pd
+    shadow = load_script("b_shadow")
+    src, _, wm = _smoke_shadow()
+    assert shadow.rescore_check(src, wm, episodes=2, windows=60) == []
+    copy = tmp_path / "shadow"
+    shutil.copytree(src, copy)
+    first = json.loads((copy / "config.json").read_text())["calibration"][0]
+    for d in sorted(copy.glob("s*")):
+        f = d / "risks.parquet"
+        df = pd.read_parquet(f)
+        hit = (df.episode == first) & (df.window == 40)
+        if hit.any():
+            df.loc[hit, "hazard"] += 1e-6
+            df.to_parquet(f, index=False)
+    assert shadow.rescore_check(copy, wm, episodes=2, windows=60) == ["hazard"]
+    refusals, _ = shadow.identity_check(copy, wm, episodes=2, windows=60)
+    assert refusals and "hazard" in refusals[0]
+    refusals, _ = shadow.identity_check(tmp_path / "missing", wm)
+    assert refusals and "could not be re-scored" in refusals[0]
+
+
+def test_code_drift(tmp_path):
+    shadow = load_script("b_shadow")
+    assert "no code commit" in shadow.code_drift({})
+    from pis.phase_b import runs
+    assert shadow.code_drift({"code_head": runs.git_head()}) is None
+    assert shadow.code_drift({"code_head": "aa71319"})                       # pis/phase_b changed since then
