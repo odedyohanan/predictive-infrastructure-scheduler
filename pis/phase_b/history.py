@@ -23,6 +23,10 @@ Window columns (dots in source names become underscores; the mappings below are 
   source                    the policy source that drove the episode
 
 `slo_v2_violation` and `deg_active` feed `incidents.label_series(viol, active, rule)` directly.
+
+Episode columns include KNOWN_COLUMNS (`known_<name>`): the parameters known in advance, at their
+start-of-episode values. World-model training pairs (`Store.training_sequences`) take state_t, the policy
+of row t+1 (decided after seeing window t) and these known values as input, and state_{t+1} as target.
 """
 from __future__ import annotations
 
@@ -42,9 +46,10 @@ from pis.shards import collect
 
 setup_imports()
 
-from worldmodel.features import POLICY_NAMES, STATE_NAMES, encode_policy, encode_state  # noqa: E402
+from sched.randomize import known_params  # noqa: E402
+from worldmodel.features import KNOWN_NAMES, POLICY_NAMES, STATE_NAMES, encode_policy, encode_state  # noqa: E402
 
-GENERATOR_VERSION = 1
+GENERATOR_VERSION = 2
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -59,17 +64,21 @@ POLICY_COLUMNS = {n: f"policy_{n}" for n in POLICY_NAMES}
 WINDOW_COLUMNS = (["episode", "window", "t"] + list(STATE_COLUMNS.values()) + list(RAW_COLUMNS.values())
                   + list(POLICY_COLUMNS.values())
                   + ["value", "slo_v2_violation", "deg_kind", "deg_active", "deg_factor", "alive_cpus", "source"])
-# the default per-window vector of training sequences: encoded state and the policy that ran
-SEQUENCE_COLUMNS = list(STATE_COLUMNS.values()) + list(POLICY_COLUMNS.values())
+# episode columns: the parameters every controller and model knows in advance (start-of-episode values)
+KNOWN_COLUMNS = {n: f"known_{n}" for n in KNOWN_NAMES}
+# world-model inputs per step (state, next policy, known; the order of worldmodel.features.INPUT_NAMES)
+INPUT_COLUMNS = list(STATE_COLUMNS.values()) + list(POLICY_COLUMNS.values()) + list(KNOWN_COLUMNS.values())
+TARGET_COLUMNS = list(STATE_COLUMNS.values())
 
 
 # ------------------------------------------------------------------ writing
 def _git_head(path: Path) -> str:
+    """HEAD of a repo, with "+dirty" when a tracked file differs from it (untracked files do not count)."""
     try:
         head = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True,
                               text=True, check=True).stdout.strip()
-        dirty = subprocess.run(["git", "-C", str(path), "status", "--porcelain"], capture_output=True,
-                               text=True, check=True).stdout.strip()
+        dirty = subprocess.run(["git", "-C", str(path), "status", "--porcelain", "--untracked-files=no"],
+                               capture_output=True, text=True, check=True).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         return "unknown"
     return head + ("+dirty" if dirty else "")
@@ -123,6 +132,7 @@ def write_episode(out_dir, scenario, records: list[dict], source: str, wall_s: f
           "magnitude": d.magnitude if d.kind != "none" else None,
           "source": source, "duration_s": float(scenario.duration_s), "windows": len(records),
           "spec": json.dumps(dataclasses.asdict(scenario.spec), sort_keys=True),
+          **{c: float(known_params(scenario.spec)[n]) for n, c in KNOWN_COLUMNS.items()},
           "generator_version": GENERATOR_VERSION, "commits": commits(),
           "wall_s": float(wall_s) if wall_s is not None else None}
     pd.DataFrame([ep]).astype({"onset_s": "float64", "ramp_s": "float64", "magnitude": "float64",
@@ -132,7 +142,12 @@ def write_episode(out_dir, scenario, records: list[dict], source: str, wall_s: f
 
 # ------------------------------------------------------------------ reading
 class Store:
-    """Read-only DuckDB views `windows` and `episodes` over every finished shard under `root`."""
+    """Read-only DuckDB views `windows` and `episodes` over every finished shard under `root`.
+
+    A store holding any held-out seed is refused when it is opened, so no query (training, inference or
+    analysis) can ever return held-out rows. Training queries accept history seeds only and every requested
+    seed must have a finished episode.
+    """
 
     def __init__(self, root):
         import duckdb
@@ -145,6 +160,10 @@ class Store:
         self._db.execute(f"CREATE VIEW windows AS SELECT * FROM read_parquet({_list(wins)})")
         self._db.execute(f"CREATE VIEW episodes AS SELECT * FROM read_parquet({_list(eps)})")
         self._columns = [r[0] for r in self._db.execute("DESCRIBE windows").fetchall()]
+        self._seeds = {int(r[0]) for r in self._db.execute("SELECT seed FROM episodes").fetchall()}
+        held = sorted(s for s in self._seeds if s in seed_ranges.HELD_OUT)
+        if held:
+            raise ValueError(f"the store holds held-out seeds {held[:5]}; held-out episodes are never stored")
 
     def _df(self, sql: str, params: list | None = None) -> pd.DataFrame:
         return self._db.execute(sql, params or []).df()
@@ -158,36 +177,59 @@ class Store:
     # -------------------------------------------------- training (history seeds only)
     def training_windows(self, seeds) -> pd.DataFrame:
         """Training: every window row of the given history seeds, by episode and window."""
-        seeds = _training_seeds(seeds)
+        seeds = self._training_seeds(seeds)
         return self._df('SELECT * FROM windows WHERE episode IN (SELECT unnest(?)) ORDER BY episode, "window"',
                         [seeds])
 
-    def training_sequences(self, seeds, context: int, horizon: int,
-                           columns: list[str] | None = None) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
-        """Training: sliding sequences inside each episode of the given history seeds.
+    def training_sequences(self, seeds, context: int,
+                           horizon: int) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+        """Training: world-model-ready sliding sequences inside each episode of the given history seeds.
 
-        Returns X [N, context, C] (windows t-context+1..t), Y [N, horizon, C] (windows t+1..t+horizon)
-        and an index frame (episode, window = t) per sequence; C = `columns` (default SEQUENCE_COLUMNS).
-        Sequences never cross episodes.
+        For a sequence ending at window t:
+          X [N, context, 75]  step j (window w = t-context+1+j) = state of w + the policy applied in window
+                              w+1 (row w+1's policy_* columns: the decision taken after seeing w) + the known
+                              parameters of the episode; columns INPUT_COLUMNS, the order of
+                              `worldmodel.features.encode_input`
+          Y [N, horizon, 39]  states of windows t+1..t+horizon (TARGET_COLUMNS: state only, no policy)
+        So X[i, -1] holds state_t and the policy that produced state_{t+1} = Y[i, 0]. The policies of
+        later horizon steps are row t+2.. policy_* columns (`window_rows`). The index frame holds (episode,
+        window = t) per sequence. Sequences never cross episodes.
         """
         if context < 1 or horizon < 1:
             raise ValueError("context and horizon must be >= 1")
-        seeds = _training_seeds(seeds)
-        columns = list(columns or SEQUENCE_COLUMNS)
-        df = self._df(f'SELECT episode, "window", {self._cols(columns)} FROM windows '
+        seeds = self._training_seeds(seeds)
+        states, pols = list(STATE_COLUMNS.values()), list(POLICY_COLUMNS.values())
+        df = self._df(f'SELECT episode, "window", {self._cols(states + pols)} FROM windows '
                       'WHERE episode IN (SELECT unnest(?)) ORDER BY episode, "window"', [seeds])
+        known = self._df(f"SELECT seed, {', '.join(KNOWN_COLUMNS.values())} FROM episodes "
+                         "WHERE seed IN (SELECT unnest(?))", [seeds]).set_index("seed")
         xs, ys, idx = [], [], []
         for ep, part in df.groupby("episode", sort=True):
-            v = part[columns].to_numpy(dtype=np.float32)
-            n = len(v) - context - horizon + 1
-            for i in range(max(n, 0)):
-                xs.append(v[i:i + context])
-                ys.append(v[i + context:i + context + horizon])
-                idx.append((int(ep), int(part.window.iloc[i + context - 1])))
-        c = len(columns)
-        x = np.stack(xs) if xs else np.zeros((0, context, c), np.float32)
-        y = np.stack(ys) if ys else np.zeros((0, horizon, c), np.float32)
+            s = part[states].to_numpy(dtype=np.float32)
+            p = part[pols].to_numpy(dtype=np.float32)
+            k = known.loc[ep].to_numpy(dtype=np.float32)
+            n = len(s) - context - horizon + 1
+            if n <= 0:
+                continue
+            steps = np.concatenate([s[:-1], p[1:], np.broadcast_to(k, (len(s) - 1, len(k)))], axis=1)
+            for i in range(n):
+                t = i + context - 1
+                xs.append(steps[i:t + 1])
+                ys.append(s[t + 1:t + 1 + horizon])
+                idx.append((int(ep), int(part.window.iloc[t])))
+        x = np.stack(xs) if xs else np.zeros((0, context, len(INPUT_COLUMNS)), np.float32)
+        y = np.stack(ys) if ys else np.zeros((0, horizon, len(TARGET_COLUMNS)), np.float32)
         return x, y, pd.DataFrame(idx, columns=["episode", "window"])
+
+    def _training_seeds(self, seeds) -> list[int]:
+        """Calibration, selection and held-out seeds never feed training; every seed must be stored."""
+        seeds = [int(s) for s in seeds]
+        seed_ranges.check(seeds, "HISTORY")
+        missing = sorted(set(seeds) - self._seeds)
+        if missing:
+            raise ValueError(f"no finished episode for history seeds {missing[:10]}"
+                             f"{' and more' if len(missing) > 10 else ''}")
+        return seeds
 
     # -------------------------------------------------- inference
     def recent_windows(self, episode: int, upto: int, n: int) -> pd.DataFrame:
@@ -213,13 +255,6 @@ class Store:
         sql = (f"SELECT {self._cols(columns)} FROM windows WHERE episode IN (SELECT unnest(?)) "
                'ORDER BY episode, "window"')
         return self._df(sql, [[int(s) for s in seeds]]).to_numpy(dtype=np.float64)
-
-
-def _training_seeds(seeds) -> list[int]:
-    """Calibration, selection and held-out seeds never feed training."""
-    seeds = [int(s) for s in seeds]
-    seed_ranges.check(seeds, "HISTORY")
-    return seeds
 
 
 def _list(paths: list[str]) -> str:

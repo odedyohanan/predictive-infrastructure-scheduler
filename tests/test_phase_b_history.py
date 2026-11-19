@@ -9,7 +9,7 @@ from pis.config import setup_imports
 
 setup_imports()
 
-from pis import shards  # noqa: E402
+from pis import adapters, shards  # noqa: E402
 from pis.candidates import is_valid, policy_key  # noqa: E402
 from pis.phase_b import history, incidents, policies, scenarios, seeds  # noqa: E402
 from pis.phase_b.episode import run_episode  # noqa: E402
@@ -125,16 +125,22 @@ def test_interventions_held_and_never_overlap():
 
 
 def test_interventions_rate_about_one_per_minute():
+    """Through `decide`, with a stub in place of R6 (the schedule is the one decide uses)."""
     ctl = policies.make("r6_interventions", scenarios.scenario_for(3106).spec, 3106)
-    n = sum(ctl._starts(10 * 120))         # ten minutes of windows, schedule only
-    assert 5 <= n <= 16
+    cur = adapters.initial_policy()
+    ctl.r6 = type("Stub", (), {"decide": lambda self, tel, current, history: (current, {})})()
+    infos = [ctl.decide({}, cur, [])[1] for _ in range(10 * 120)]      # ten minutes of windows
+    starts = [i for i, f in enumerate(infos) if f.get("intervention_start")]
+    assert 5 <= len(starts) <= 16
+    assert all(b - a >= policies.INTERVENTION_WINDOWS for a, b in zip(starts, starts[1:]))
+    held = sum(f.get("intervention") is not None for f in infos)
+    assert held == sum(min(policies.INTERVENTION_WINDOWS, len(infos) - i) for i in starts)
 
 
 def test_interventions_deterministic():
     spec = scenarios.scenario_for(3107).spec
-    a = policies.make("r6_interventions", spec, 3107)._starts(600)
-    b = policies.make("r6_interventions", spec, 3107)._starts(600)
-    assert a == b
+    a, b = (policies.make("r6_interventions", spec, 3107) for _ in range(2))
+    assert [a._next_window() for _ in range(600)] == [b._next_window() for _ in range(600)]
 
 
 # ------------------------------------------------------------------ store
@@ -201,18 +207,99 @@ def test_training_refuses_non_history(store_root):
             st.training_sequences(bad, 4, 2)
 
 
-def test_training_sequences(store_root):
+def _synthetic_shard(root, seeds, n=12):
+    """Hand-made window and episode files: state = 100 * episode + window, policy_share_A = window / 100."""
+    d = root / f"s{seeds[0]}"
+    d.mkdir(parents=True)
+    for seed in seeds:
+        rows = {"episode": [seed] * n, "window": list(range(n)), "t": [0.5 * (w + 1) for w in range(n)]}
+        for c in history.STATE_COLUMNS.values():
+            rows[c] = [float(100 * seed + w) for w in range(n)]
+        for c in history.RAW_COLUMNS.values():
+            rows[c] = [0] * n
+        for c in history.POLICY_COLUMNS.values():
+            rows[c] = [w / 100.0 if c == "policy_share_A" else 0.0 for w in range(n)]
+        rows.update(value=[1.0] * n, slo_v2_violation=[False] * n, deg_kind=["none"] * n, deg_active=[False] * n,
+                    deg_factor=[0.0] * n, alive_cpus=[8] * n, source=["r6"] * n)
+        pd.DataFrame(rows, columns=history.WINDOW_COLUMNS).to_parquet(d / f"windows-{seed}.parquet")
+        ep = {"seed": seed, "kind": "none", "source": "r6", "windows": n,
+              **{c: float(i + 1) for i, c in enumerate(history.KNOWN_COLUMNS.values())}}
+        pd.DataFrame([ep]).to_parquet(d / f"episodes-{seed}.parquet")
+    (d / shards.DONE).write_text("")
+    return d
+
+
+def test_training_sequences_are_world_model_pairs(tmp_path):
+    _synthetic_shard(tmp_path, [3100, 3101])
+    st = history.Store(tmp_path)
+    x, y, idx = st.training_sequences([3100, 3101], context=4, horizon=2)
+    assert x.shape == (2 * (12 - 4 - 2 + 1), 4, len(history.INPUT_COLUMNS)) == (14, 4, 75)
+    assert y.shape == (14, 2, 39)
+    assert history.INPUT_COLUMNS == ([history.STATE_COLUMNS[n] for n in STATE_NAMES]
+                                     + [history.POLICY_COLUMNS[n] for n in POLICY_NAMES]
+                                     + [history.KNOWN_COLUMNS[n] for n in history.KNOWN_NAMES])
+    assert not [c for c in history.TARGET_COLUMNS if c.startswith("policy_")]
+    share = history.INPUT_COLUMNS.index("policy_share_A")
+    state0 = history.INPUT_COLUMNS.index("a_rate")
+    known = [history.INPUT_COLUMNS.index(c) for c in history.KNOWN_COLUMNS.values()]
+    for i, (ep, t) in enumerate(zip(idx.episode, idx.window)):
+        assert x[i, -1, state0] == 100 * ep + t                          # state_t
+        assert x[i, -1, share] == pytest.approx((t + 1) / 100)           # row t+1's policy
+        np.testing.assert_allclose(x[i, :, state0], 100 * ep + np.arange(t - 3, t + 1))
+        np.testing.assert_allclose(x[i, :, share], np.arange(t - 2, t + 2) / 100, rtol=1e-6)
+        np.testing.assert_allclose(x[i][:, known], np.tile([1.0, 2.0, 3.0], (4, 1)))
+        np.testing.assert_allclose(y[i, :, 0], 100 * ep + np.array([t + 1, t + 2]))
+    assert list(idx[idx.episode == 3100].window) == list(range(3, 10))     # t + horizon <= 11
+
+
+def test_training_sequences_real_episodes(store_root):
     root, eps = store_root
     st = history.Store(root)
     x, y, idx = st.training_sequences([3100, 3101], context=4, horizon=2)
     n = sum(len(recs) - 4 - 2 + 1 for _, recs in eps.values())
-    assert x.shape == (n, 4, len(history.SEQUENCE_COLUMNS))
-    assert y.shape == (n, 2, len(history.SEQUENCE_COLUMNS))
-    assert len(idx) == n
-    rows = st.window_rows(3101, 0, 40)
+    assert x.shape == (n, 4, 75) and y.shape == (n, 2, 39) and len(idx) == n
+    sc, recs = eps[3101]
     i = int(np.flatnonzero((idx.episode == 3101).to_numpy() & (idx.window == 5).to_numpy())[0])
-    np.testing.assert_allclose(x[i], rows[history.SEQUENCE_COLUMNS].to_numpy()[2:6])
-    np.testing.assert_allclose(y[i], rows[history.SEQUENCE_COLUMNS].to_numpy()[6:8])
+    from worldmodel.features import encode_input
+    from pis.adapters import known_of
+    want = np.stack([encode_input(encode_state(recs[w]["tel"]), recs[w + 1]["applied"], known_of(sc.spec))
+                     for w in range(2, 6)])
+    np.testing.assert_allclose(x[i], want, rtol=1e-5)
+    np.testing.assert_allclose(y[i], np.stack([encode_state(recs[w]["tel"]) for w in (6, 7)]), rtol=1e-6)
+
+
+def test_training_refuses_missing_seeds(tmp_path):
+    _synthetic_shard(tmp_path, [3100, 3101])
+    st = history.Store(tmp_path)
+    for call in (lambda s: st.training_windows(s), lambda s: st.training_sequences(s, 2, 1)):
+        with pytest.raises(ValueError, match="3102"):
+            call([3100, 3102])
+
+
+def test_store_refuses_held_out(tmp_path):
+    _synthetic_shard(tmp_path, [3100])
+    _synthetic_shard(tmp_path, [3005])
+    with pytest.raises(ValueError, match="held-out"):
+        history.Store(tmp_path)
+
+
+def _repo(path):
+    import subprocess
+    git = ["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=test"]
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    (path / "a.txt").write_text("1")
+    subprocess.run(git + ["add", "a.txt"], check=True)
+    subprocess.run(git + ["commit", "-q", "-m", "x"], check=True)
+
+
+def test_provenance_ignores_untracked(tmp_path):
+    _repo(tmp_path)
+    (tmp_path / "new_folder").mkdir()
+    (tmp_path / "new_folder" / "b.txt").write_text("x")
+    head = history._git_head(tmp_path)
+    assert len(head) == 40 and not head.endswith("+dirty")
+    (tmp_path / "a.txt").write_text("2")
+    assert history._git_head(tmp_path).endswith("+dirty")
 
 
 def test_inference_query_no_future(store_root):

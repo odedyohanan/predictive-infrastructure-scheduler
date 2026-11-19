@@ -113,42 +113,38 @@ class R6Interventions:
         self.start_p = start_p
         self.held: dict | None = None
         self.name: str | None = None
-        self.left = 0
+        self.left = 0                                   # windows still held after this one
 
-    def _start_now(self) -> bool:
-        """One draw of the schedule for a window with no intervention in force."""
-        return bool(self.rng.uniform() < self.start_p)
+    def _next_window(self) -> str:
+        """Advance the start schedule by one window: "start", "hold" (an intervention is in force) or "free".
 
-    def _starts(self, n_windows: int) -> list[bool]:
-        """The start schedule alone over `n_windows` (consumes this controller's draws; for checks)."""
-        out, left = [], 0
-        for _ in range(n_windows):
-            if left > 0:
-                left -= 1
-                out.append(False)
-            elif self._start_now():
-                out.append(True)
-                left = INTERVENTION_WINDOWS - 1
-            else:
-                out.append(False)
-        return out
+        The only place the schedule lives; `decide` calls it once per window.
+        """
+        if self.left > 0:
+            self.left -= 1
+            return "hold"
+        if self.rng.uniform() < self.start_p:
+            self.left = INTERVENTION_WINDOWS - 1
+            return "start"
+        return "free"
 
     def decide(self, tel, current, history):
         from pis.probe import named_interventions
         t0 = time.perf_counter()
         policy, info = self.r6.decide(tel, current, history)
-        start = False
-        if self.left == 0 and self._start_now():
+        step = self._next_window()
+        if step == "start":
             cur = policy_key(current)
             options = {n: after for n, (_, after) in named_interventions(current).items()
                        if policy_key(after) != cur}
             if options:
                 names = sorted(options)
                 self.name = names[int(self.choice_rng.integers(len(names)))]
-                self.held, self.left, start = options[self.name], INTERVENTION_WINDOWS, True
-        if self.left > 0:
+                self.held = options[self.name]
+            else:                               # nothing to apply: the window stays free
+                self.left, step = 0, "free"
+        if step != "free":
             policy = copy.deepcopy(self.held)
-            self.left -= 1
-            info = {**info, "intervention": self.name, "intervention_start": start}
+            info = {**info, "intervention": self.name, "intervention_start": step == "start"}
         info["decide_ms"] = (time.perf_counter() - t0) * 1000.0
         return policy, info
