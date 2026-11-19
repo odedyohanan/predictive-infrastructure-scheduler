@@ -72,19 +72,7 @@ def read_incident(path: Path, horizon: int | None) -> dict:
     return {**cfg, "H": int(horizon or cfg["H"])}
 
 
-def check_mc_config(labels: Path, inc: dict) -> None:
-    """The Monte Carlo labels must come from a run with the same rule (k, interval, majority, warm-up) and H;
-    their run's config.json sits next to the labels file."""
-    cfg_path = Path(labels).parent / "config.json"
-    if not cfg_path.exists():
-        raise ValueError("the Monte Carlo labels have no run config.json next to them")
-    cfg = runs.read_json(cfg_path)
-    want = {"k": int(inc["k"]), "interval": int(inc["interval"]), "majority": float(inc["majority"]),
-            "warmup": int(inc["warmup"]), "horizon": int(inc["H"])}
-    diff = [k for k, v in want.items() if k not in cfg or cfg[k] != v]
-    if diff:
-        raise ValueError(f"the Monte Carlo labels were made with a different {', '.join(diff)} "
-                         f"({ {k: cfg.get(k) for k in diff} } vs { {k: want[k] for k in diff} })")
+check_mc_config = runs.check_mc_config
 
 
 def note_text(name: str, rec: dict, hist: list[dict], cal: dict, verdict) -> str:

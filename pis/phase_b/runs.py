@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import subprocess
 from pathlib import Path
 
@@ -91,3 +93,40 @@ def read_json(path: Path) -> dict:
 def write_json(path: Path, obj: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n")
+
+
+def fmt(x, spec: str | None = None, *, default: str = "{:.2f}") -> str:
+    """A number for a note with `spec` (else `default`): "-" for None, NaN and infinities. Scripts bind their
+    own default with functools.partial."""
+    return "-" if x is None or (isinstance(x, float) and not math.isfinite(x)) else (spec or default).format(x)
+
+
+def check_mc_config(labels: Path, inc: dict) -> None:
+    """The Monte Carlo labels must come from a run with the same rule (k, interval, majority, warm-up) and H;
+    their run's config.json sits next to the labels file."""
+    cfg_path = Path(labels).parent / "config.json"
+    if not cfg_path.exists():
+        raise ValueError("the Monte Carlo labels have no run config.json next to them")
+    cfg = read_json(cfg_path)
+    want = {"k": int(inc["k"]), "interval": int(inc["interval"]), "majority": float(inc["majority"]),
+            "warmup": int(inc["warmup"]), "horizon": int(inc["H"])}
+    diff = [k for k, v in want.items() if k not in cfg or cfg[k] != v]
+    if diff:
+        raise ValueError(f"the Monte Carlo labels were made with a different {', '.join(diff)} "
+                         f"({ {k: cfg.get(k) for k in diff} } vs { {k: want[k] for k in diff} })")
+
+
+PRIO_DARWIN_PROCESS = 4         # <sys/resource.h>; getpriority gives 1 for a process in background QoS
+
+
+def background_priority() -> tuple[bool, str]:
+    """Whether this process runs at background priority (scripts/gentle.sh: macOS background QoS via
+    `taskpolicy -b`, or a positive nice value elsewhere), and how that was read."""
+    nice = os.getpriority(os.PRIO_PROCESS, 0)
+    try:
+        darwin_bg = os.getpriority(PRIO_DARWIN_PROCESS, 0) == 1
+    except OSError:
+        darwin_bg = False
+    if darwin_bg:
+        return True, "macOS background QoS"
+    return (nice > 0), f"nice {nice}"
