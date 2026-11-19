@@ -21,10 +21,10 @@ share <= alpha = 0.10, `low` = 0.7 x threshold); on the selection episodes recal
 lead >= min_lead_windows, median lead, pooled false-alarm rate, alarm events per quiet episode and the Brier
 score of the window risk against the Monte Carlo labels, split by cause (a labelled state is "building_up"
 when a degradation is active at it). All bootstrap intervals use one shared resample stream (same tag, same
-selection episodes): common random numbers across predictors and causes. Question 1: each learned predictor's building-up recall minus that of
-the better non-learned one, with a 95 % bootstrap interval over selection episodes. The predictor with the
-best building-up recall (ties: lower false-alarm rate) goes to the alarms config; the note ends with the
-gate: recall <= 0.2 stops before prevention.
+selection episodes): common random numbers across predictors and causes. Question 1: each learned
+predictor's building-up recall minus that of the better non-learned one, with a 95 % bootstrap interval over
+selection episodes. The predictor with the best building-up recall (ties: lower false-alarm rate) goes to
+the alarms config; the note ends with the gate: recall <= 0.2 stops before prevention.
 
 Real runs: the full calibration (3400-3449) and selection (3450-3499) ranges, all five predictors, a clean
 tree, configs/phase_b/incident.json (rule, H, min_lead_windows), the Monte Carlo labels and a world model
@@ -107,23 +107,43 @@ def make_predictors(store, names, rule, H, fit_seeds, calibration, smoke, overri
     return out
 
 
+def load_predictors(fitted, names, rule: dict, world_model=None, wm_n: int = 32) -> dict:
+    """The predictors in `names` as the shadow run uses them: the fitted ones from its pickle (`fitted`, may
+    be None when only the world model is asked for), the world model from its checkpoint with `wm_n`
+    futures. Call `for_episode` before each episode."""
+    from pis.phase_b import incidents, predictors
+    preds = pickle.loads(Path(fitted).read_bytes()) if fitted is not None else {}
+    if "world_model" in names:
+        from pis.phase_b.wm_prob import ProbWorldModel
+        if world_model is None:
+            raise ValueError("the world-model predictor needs a checkpoint")
+        rule_ = incidents.IncidentRule(rule["k"], rule["interval"], rule["majority"])
+        preds["world_model"] = predictors.WorldModelPredictor(ProbWorldModel.load(world_model), rule_,
+                                                              n=wm_n, warmup=int(rule["warmup"]))
+    missing = [n for n in names if n not in preds]
+    if missing:
+        raise ValueError(f"no fitted predictor {missing} in the shadow run's pickle")
+    return {n: preds[n] for n in names}
+
+
+def for_episode(preds: dict, episode: int) -> None:
+    """Sampling seeds of the world-model predictor for an episode: WM_TAG + episode*1000 (+ the window)."""
+    if "world_model" in preds:
+        preds["world_model"].seed = WM_TAG + int(episode) * 1000
+
+
 def run_shard(shard, shard_dir: Path, params: dict) -> None:
     """Risk series of every predictor for the shard's episodes (NaN before the warm-up)."""
     import pandas as pd
     import torch
     torch.set_num_threads(1)
-    from pis.phase_b import features, incidents, predictors
+    from pis.phase_b import features
     from pis.phase_b.history import Store
     store = Store(params["store"])
     eps = store.episodes().set_index("seed")
-    preds = pickle.loads(Path(params["fitted"]).read_bytes())
     rule = params["rule"]
     H, warmup = int(rule["H"]), int(rule["warmup"])
-    if "world_model" in params["names"]:
-        from pis.phase_b.wm_prob import ProbWorldModel
-        rule_ = incidents.IncidentRule(rule["k"], rule["interval"], rule["majority"])
-        preds["world_model"] = predictors.WorldModelPredictor(ProbWorldModel.load(params["world_model"]), rule_,
-                                                              n=params["wm_n"], warmup=warmup)
+    preds = load_predictors(params["fitted"], params["names"], rule, params["world_model"], params["wm_n"])
     names = [n for n in params["names"] if n in preds]
     seconds = {n: 0.0 for n in names}
     frames, windows = [], 0
@@ -132,8 +152,7 @@ def run_shard(shard, shard_dir: Path, params: dict) -> None:
         T = int(eps.loc[ep, "windows"])
         rows = features.join_known(store.window_rows(ep, 0, T), eps.reset_index())
         rows = rows.drop(columns=[c for c in HIDDEN if c in rows.columns])
-        if "world_model" in preds:
-            preds["world_model"].seed = WM_TAG + ep * 1000
+        for_episode(preds, ep)
         risk = {n: np.full(T, np.nan) for n in names}
         for t in range(warmup, T):
             seen = rows.iloc[:t + 1]

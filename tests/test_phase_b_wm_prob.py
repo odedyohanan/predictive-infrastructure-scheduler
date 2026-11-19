@@ -153,6 +153,22 @@ def test_sample_rollouts_shape_and_clipping():
     np.testing.assert_array_equal(m.sample_rollouts(_window(), per_step, None, 7, 5, seed=1), out)
 
 
+def test_sample_rollouts_batch_of_candidates():
+    m = _tiny_model(context=4, room=8)
+    w = _window()
+    p, q = w.policies[-1], w.policies[-2]
+    one = m.sample_rollouts_batch(w, [p], None, horizon=6, n=5, seed=3)
+    assert one.shape == (1, 5, 6, 43)
+    np.testing.assert_array_equal(one[0], m.sample_rollouts(w, p, None, 6, 5, seed=3))   # same draws
+    two = m.sample_rollouts_batch(w, [p, q], None, horizon=6, n=5, seed=3)
+    assert two.shape == (2, 5, 6, 43)
+    np.testing.assert_array_equal(two, m.sample_rollouts_batch(w, [p, q], None, 6, 5, seed=3))
+    assert np.abs(two[0] - two[1]).max() > 0
+    assert two.min() >= 0.0 and two.max() <= 3.0
+    long = m.sample_rollouts_batch(w, [p, q], None, horizon=20, n=3, seed=3)   # restarts past the room
+    assert long.shape == (2, 3, 20, 43) and np.isfinite(long).all()
+
+
 def _reference_rollout(m, hist, pol, horizon, n, seed):
     """Rollout by re-running the network on the whole input sequence of the current segment at every step.
 

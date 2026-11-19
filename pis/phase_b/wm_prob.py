@@ -137,8 +137,27 @@ class ProbWorldModel:
         per step [horizon, 33]; the first runs in the window right after the history. `known`: dict or
         3-vector, or None to use `history.known`. States are clipped to the training range (and at 0).
         """
-        k = features.known_vector(known if known is not None else history.known)
         pols = self._policy_steps(policy, horizon)
+        return self._sample(history, np.broadcast_to(pols, (n,) + pols.shape), known, horizon, seed)
+
+    def sample_rollouts_batch(self, history: features.Window, policies, known, horizon: int, n: int,
+                              seed: int | None = None) -> np.ndarray:
+        """`n` sampled futures for each of several candidate policies in one pass: [K, n, horizon, 43].
+
+        Each element of `policies` is what `sample_rollouts` accepts as `policy`. All K x n futures share
+        one random stream (row-major: candidate, then future); a single candidate gets exactly the futures
+        `sample_rollouts` draws with the same seed.
+        """
+        pols = np.stack([self._policy_steps(p, horizon) for p in policies])
+        rows = np.repeat(pols, n, axis=0)
+        out = self._sample(history, rows, known, horizon, seed)
+        return out.reshape(len(pols), n, horizon, out.shape[-1])
+
+    def _sample(self, history: features.Window, pols: np.ndarray, known, horizon: int,
+                seed: int | None) -> np.ndarray:
+        """Ancestral sampling of one future per row of `pols` [R, horizon, 33]."""
+        k = features.known_vector(known if known is not None else history.known)
+        n = pols.shape[0]
         C, longest = self.context, self.context + self.room
         S, P = history.states[-C:], history.policies[-C:]
         past = np.concatenate([S[:-1], P[1:], np.broadcast_to(k, (len(S) - 1, len(k)))], axis=1)
@@ -149,10 +168,10 @@ class ProbWorldModel:
         rng = np.random.default_rng(seed)
         std, mu = self.y_norm.std, self.y_norm.mean
         out = np.empty((n, horizon, S.shape[1]), dtype=np.float32)
+        kk = np.broadcast_to(k, (n, len(k)))
         state, used = None, 0
         for h in range(horizon):
-            x = np.concatenate([s, np.broadcast_to(pols[h], (n, pols.shape[1])),
-                                np.broadcast_to(k, (n, len(k)))], axis=1)
+            x = np.concatenate([s, pols[:, h], kk], axis=1)
             seq.append(self.x_norm.transform(x)[:, None])
             if state is None or used >= longest:        # (re)start from the last `context` inputs
                 win = np.concatenate(seq, axis=1)[:, -C:]

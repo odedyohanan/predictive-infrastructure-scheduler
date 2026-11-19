@@ -58,6 +58,21 @@ def smoke_dir(path: str | None) -> Path:
     return p
 
 
+def load_script(name: str):
+    """Import one of the experiment scripts by file path (the sibling repos have an `experiments` package
+    too), to share its code with another script."""
+    import importlib.util
+    import sys
+    key = f"pis_exp_{name}"
+    if key in sys.modules:
+        return sys.modules[key]
+    spec = importlib.util.spec_from_file_location(key, ROOT / "experiments" / f"{name}.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[key] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def write_note(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(scrub(text))

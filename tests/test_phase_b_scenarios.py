@@ -262,6 +262,30 @@ def test_run_episode_matches_harness_without_degradation():
     assert [(_strip(r["tel"]), r["policy"]) for r in mine] == [(r["tel"], r["policy"]) for r in ref]
 
 
+class WithDsim(Fixed):
+    def __init__(self, policy):
+        super().__init__(policy)
+        self.dsims, self.sims = [], []
+
+    def attach_dsim(self, dsim):
+        self.dsims.append(dsim)
+
+    def attach_sim(self, sim):
+        self.sims.append(sim)
+
+
+def test_run_episode_attaches_degraded_sim():
+    sc = _scenario("cpu_loss", onset=1.0, duration=3.0)
+    pol = adapters.initial_policy()
+    ctl = WithDsim(pol)
+    recs = run_episode(sc, ctl, "fixed")
+    assert len(ctl.dsims) == 1 and isinstance(ctl.dsims[0], DegradedSim)
+    assert ctl.sims == [ctl.dsims[0].sim]                     # the same running simulator
+    assert ctl.dsims[0].scenario is sc and ctl.dsims[0].done()
+    plain = run_episode(sc, Fixed(pol), "fixed")             # behaviour without the hook is unchanged
+    assert [r["tel"] for r in plain] == [r["tel"] for r in recs]
+
+
 def _mid_burst_sim():
     """A full-length scenario whose clock sits inside a burst (the rest of the state is irrelevant)."""
     ds = DegradedSim(scenarios.scenario_for(3400))

@@ -14,12 +14,15 @@ def run_episode(scenario: Scenario, controller: Controller, policy_source: str,
     policy that actually ran in the window that produced `tel`) and "source" (`policy_source`).
 
     `on_window(dsim, record)` is called after each record, with the simulator at the window's end.
-    Controllers with `attach_sim` get the underlying simulator. Controllers never see the
+    Controllers with `attach_sim` get the underlying simulator, and those with `attach_dsim` the
+    `DegradedSim` around it (to branch the real system with its degradation schedule). Controllers never see the
     "phase_b" block of the telemetry (the degradation is not announced); records keep it.
     """
     ds = DegradedSim(scenario)
     if hasattr(controller, "attach_sim"):
         controller.attach_sim(ds.sim)
+    if hasattr(controller, "attach_dsim"):
+        controller.attach_dsim(ds)
     current = initial_policy()
     records: list[dict] = []
     history: list[tuple[dict, dict]] = []

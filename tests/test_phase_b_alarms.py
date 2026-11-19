@@ -349,3 +349,21 @@ def test_shadow_refuses_non_r6_episodes(shadow, tmp_path):
         shadow.shadow(store, rule, ["queueing"], list(range(3100, 3112)), list(range(3400, 3406)),
                       list(range(3450, 3456)), None, 4, None, tmp_path / "out", tmp_path / "n.md",
                       tmp_path / "a.json", 1)
+
+
+def test_load_predictors_shared_with_the_advisor(shadow, tmp_path):
+    import pickle
+    from pis.phase_b import predictors
+    rule = {"k": 3, "interval": 12, "majority": 0.5, "warmup": 20, "H": 20, "min_lead_windows": 2}
+    q = predictors.QueueingModel(IncidentRule(3, 12, 0.5), scale=0.7)
+    (tmp_path / "p.pkl").write_bytes(pickle.dumps({"queueing": q}))
+    wm = _tiny_wm(tmp_path / "wm.pt", [3100])
+    got = shadow.load_predictors(tmp_path / "p.pkl", ["queueing", "world_model"], rule, wm, wm_n=5)
+    assert set(got) == {"queueing", "world_model"} and got["queueing"].scale == 0.7
+    assert got["world_model"].n == 5 and got["world_model"].warmup == 20
+    shadow.for_episode(got, 3451)
+    assert got["world_model"].seed == shadow.WM_TAG + 3451 * 1000
+    with pytest.raises(ValueError):
+        shadow.load_predictors(tmp_path / "p.pkl", ["hazard"], rule)
+    with pytest.raises(ValueError):
+        shadow.load_predictors(None, ["world_model"], rule)
