@@ -260,3 +260,42 @@ def test_run_episode_matches_harness_without_degradation():
     mine = run_episode(sc, BaseGreedyController(sc.spec), "r6")
     ref = run_scenario(seed, BaseGreedyController(sc.spec), duration_s=10.0)
     assert [(_strip(r["tel"]), r["policy"]) for r in mine] == [(r["tel"], r["policy"]) for r in ref]
+
+
+def _mid_burst_sim():
+    """A full-length scenario whose clock sits inside a burst (the rest of the state is irrelevant)."""
+    ds = DegradedSim(scenarios.scenario_for(3400))
+    b = ds.sim.bursts
+    i = int(np.argmax(b > 20.0))
+    assert b[i] > 20.0 and i + 1 < len(b)
+    ds.sim.t = float(b[i]) + 0.5 * ds.sim.spec.a.burst_len      # burst i is ongoing
+    return ds, i
+
+
+def test_reseeded_clone_redraws_future_bursts():
+    ds, i = _mid_burst_sim()
+    a, b = ds.clone(reseed=11), ds.clone(reseed=12)
+    t = ds.sim.t
+    for c in (a, b):
+        assert np.array_equal(c.sim.bursts[c.sim.bursts <= t], ds.sim.bursts[:i + 1])   # past and ongoing kept
+        assert np.all(np.diff(c.sim.bursts) > 0) and c.sim.bursts[-1] < c.sim.duration
+    assert not np.array_equal(a.sim.bursts[a.sim.bursts > t], b.sim.bursts[b.sim.bursts > t])
+    assert not np.array_equal(a.sim.bursts[a.sim.bursts > t], ds.sim.bursts[i + 1:])
+    assert np.array_equal(ds.clone(reseed=11).sim.bursts, a.sim.bursts)                # same reseed, same bursts
+
+
+def test_clone_without_reseed_keeps_bursts():
+    ds, _ = _mid_burst_sim()
+    assert np.array_equal(ds.clone().sim.bursts, ds.sim.bursts)
+
+
+def test_redrawn_burst_gaps_follow_the_spec():
+    ds, _ = _mid_burst_sim()
+    t = ds.sim.t
+    gaps = []
+    for r in range(300):
+        f = ds.clone(reseed=r).sim.bursts
+        f = f[f > t]
+        if len(f):
+            gaps += [f[0] - t] + list(np.diff(f))
+    assert np.mean(gaps) == pytest.approx(ds.sim.spec.a.burst_every, rel=0.15)

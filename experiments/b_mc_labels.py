@@ -82,8 +82,8 @@ def run_shard(shard, shard_dir: Path, params: dict) -> None:
             rows.append({"episode": ep, "window": state.t, "risk": float(risk), "n": int(n),
                          "method": params["method"], "stratum": stratum_of[state.t],
                          "kind": state.dsim.scenario.kind, "in_incident": now,
-                         # upper bound for splitting: copies start part-way through the horizon
-                         "branch_windows": int(n) * h, "branch_s": dt})
+                         # upper bound for splitting: copies start part-way through the branch
+                         "branch_windows": int(n) * mc_labels.branch_windows(h, rule), "branch_s": dt})
 
         mc_labels.replay_visit(ep, list(stratum_of), visit)
         replay_s = time.time() - t_rep - clock["branch_s"]
@@ -91,6 +91,11 @@ def run_shard(shard, shard_dir: Path, params: dict) -> None:
             if r["episode"] == ep:
                 r["replay_s"] = replay_s / len(items)
     pd.DataFrame(rows).to_parquet(shard_dir / LABELS_FILE, index=False)
+
+
+# Label columns: episode, window (t), risk, n (branches, or paths for splitting), method, stratum, kind,
+# in_incident (in incident by the rule applied to windows 0..t only: a run in progress at t that becomes an
+# incident later is not marked), branch_windows, branch_s, replay_s (timing).
 
 
 def make_shards(states):
@@ -157,7 +162,10 @@ def note_text(cfg: dict, plain: dict, chosen: str, final, restart: dict | None, 
              f"Rule k={cfg['k']}, interval={cfg['interval']}, majority={cfg['majority']}, warm-up {cfg['warmup']}; "
              f"horizon H={cfg['horizon']} windows.",
              f"States: {plain['states']} (shards of {SHARD_SIZE}); {cfg['branches']} branches each, reseed "
-             f"12_000_000 + seed*1000 + j; R6 greedy continues in every branch.", "",
+             f"12_000_000 + seed*1000 + j; R6 greedy continues in every branch for H + k - 1 windows (onsets "
+             "counted in (t, t + H]); reseeding redraws arrivals, service times and A's future bursts.",
+             "All states of one episode reuse the same reseed streams, so labels within an episode are slightly "
+             "correlated.", "",
              "## Plain branching", "",
              f"- risk = 0 in {plain['zero_share']:.1%} of states; mean risk {plain['mean_risk']:.3f}",
              f"- {plain['s_per_branch_window'] * 1000:.1f} ms per branch-window, replay "
@@ -222,7 +230,7 @@ def main(argv=None) -> dict:
     store = Store(a.store)
     try:
         eps = episode_table(store, seeds, rule, int(inc["warmup"]))
-        states = mc_labels.sample_states(eps, a.states, horizon, int(inc["warmup"]))
+        states = mc_labels.sample_states(eps, a.states, horizon, int(inc["warmup"]), tail=rule.k - 1)
     except ValueError as e:
         raise SystemExit(f"refusing to run: {e}")
     out = (sdir / "mc_labels") if smoke else ROOT / DEFAULT_OUT

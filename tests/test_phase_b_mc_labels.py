@@ -46,6 +46,18 @@ def test_state_inside_incident_counts_only_new_onsets():
     assert not mc_labels.new_onset(viol, act, RULE, t=25, horizon=10, warmup=20)
 
 
+def test_onset_near_horizon_end_needs_the_tail():
+    # k = 3: a run starting at t+h-1 reaches length 3 only after t+h; its onset (t+h-1) is within h
+    rule = IncidentRule(k=3, interval=100)
+    viol = np.zeros(60, dtype=bool)
+    act = np.zeros(60, dtype=bool)
+    t, h = 30, 10
+    viol[t + h - 1:t + h + 2] = True
+    assert not mc_labels.new_onset(viol[:t + h + 1], act[:t + h + 1], rule, t=t, horizon=h, warmup=20)
+    n = t + 1 + mc_labels.branch_windows(h, rule)
+    assert mc_labels.new_onset(viol[:n], act[:n], rule, t=t, horizon=h, warmup=20)
+
+
 def test_new_onset_ignores_warmup():
     viol = np.zeros(40, dtype=bool)
     viol[5:8] = True
@@ -109,6 +121,42 @@ def test_branch_deterministic_for_fixed_reseeds(cpu_state):
     r2 = mc_labels.branch_risk(cpu_state, RULE, horizon=4, n_branches=3, reseed_base=mc_labels.branch_reseed(3400, 0),
                                warmup=0)
     assert r1 == r2 and 0.0 <= r1 <= 1.0
+
+
+def test_different_reseeds_give_different_futures(cpu_state):
+    a = mc_labels.continue_branch(cpu_state, 4, reseed=mc_labels.branch_reseed(3400, 5))
+    b = mc_labels.continue_branch(cpu_state, 4, reseed=mc_labels.branch_reseed(3400, 6))
+    assert any(x["tel"]["a"]["arrivals"] != y["tel"]["a"]["arrivals"] for x, y in zip(a, b))
+
+
+def test_dead_cpus_stay_dead_in_branches():
+    sc = _scenario(degradation=Degradation("cpu_loss", 1.0, 0.0, 2.0))
+    st = mc_labels.state_at(sc, 5)       # CPUs lost since window 2
+    assert st.records[-1]["tel"]["phase_b"]["alive_cpus"] == [0, 1, 4, 5, 6, 7]
+    for j in range(2):
+        for r in mc_labels.continue_branch(st, 3, reseed=mc_labels.branch_reseed(3400, 7 + j)):
+            assert r["tel"]["phase_b"]["active"] and r["tel"]["phase_b"]["alive_cpus"] == [0, 1, 4, 5, 6, 7]
+            for w in r["applied"]["workloads"].values():
+                assert not set(w["preferred_cpus"]) & {2, 3}
+
+
+def test_branch_controllers_share_no_mutable_state(cpu_state):
+    a = mc_labels.clone_controller(cpu_state.controller)
+    b = mc_labels.clone_controller(cpu_state.controller)
+    assert a.base.history is not b.base.history is not cpu_state.controller.base.history
+    assert a.rng is not b.rng
+    assert a.base.model is b.base.model is cpu_state.controller.base.model     # read-only weights shared
+    a.base.history.append(-1.0)
+    assert b.base.history == cpu_state.controller.base.history
+
+
+def test_branch_risk_runs_the_tail(cpu_state, monkeypatch):
+    seen = []
+    real = mc_labels.continue_branch
+    monkeypatch.setattr(mc_labels, "continue_branch", lambda st, n, r, hold=None: seen.append(n) or real(st, n, r))
+    rule = IncidentRule(k=3, interval=12)
+    mc_labels.branch_risk(cpu_state, rule, horizon=4, n_branches=1, reseed_base=1, warmup=0)
+    assert seen == [4 + 3 - 1]
 
 
 def test_branch_hold_policy(cpu_state):
@@ -248,6 +296,8 @@ def test_onset_near_end_keeps_room_for_horizon():
     eps = [{"episode": 3401, "degraded": True, "onsets": [590], "windows": 600}]
     states = mc_labels.sample_states(eps, n=10, horizon=20, warmup=20)
     assert all(s[1] <= 579 for s in states)
+    states = mc_labels.sample_states(eps, n=10, horizon=20, warmup=20, tail=6)
+    assert all(s[1] <= 573 for s in states)
 
 
 # ------------------------------------------------------------------ script guards

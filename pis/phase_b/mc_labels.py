@@ -6,9 +6,11 @@ deterministic, so re-running seed `s` with a fresh R6 reproduces the stored tele
 R6-driven episodes can be replayed (the stored policy encoding cannot be decoded back to a policy).
 
 A branch clones the simulator (with its degradation schedule and dead CPUs) and the controller (R6 keeps
-a history of rates), reseeds the simulator's future randomness and lets R6 continue. The label is whether
-a counted incident starts in (t, t + horizon] on the joined series (records so far + branch), so an
-incident already in force at t never counts; a new one after it ends does.
+a history of rates), reseeds the simulator's future randomness (arrivals, service and A's future bursts)
+and lets R6 continue. The label is whether a counted incident starts in (t, t + horizon] on the joined
+series (records so far + branch), so an incident already in force at t never counts; a new one after it
+ends does. Branches run k - 1 windows past the horizon: a violation run starting near t + horizon is only
+an incident once it reaches length k.
 
 `restart_risk` estimates the same probability by multilevel splitting on A's overdue backlog, for states
 where plain branching almost never sees an incident.
@@ -162,6 +164,12 @@ class Branch:
                       self.current, self.hold, list(self.records))
 
 
+def branch_windows(horizon: int, rule: incidents.IncidentRule) -> int:
+    """Windows a branch runs to judge onsets within `horizon`: runs need k windows to become incidents
+    (the majority rule only looks back)."""
+    return horizon + rule.k - 1
+
+
 def windows_left(state: State) -> int:
     sc = state.dsim.scenario
     return int(round(sc.duration_s / sc.spec.policy_period_s)) - (state.t + 1)
@@ -213,7 +221,8 @@ def branch_risk(state: State, rule: incidents.IncidentRule, horizon: int, n_bran
     if n_branches < 1:
         raise ValueError("n_branches must be >= 1")
     base = series(state.records)
-    hits = sum(_hit(base, continue_branch(state, horizon, reseed_base + j), rule, state.t, horizon, warmup)
+    n = branch_windows(horizon, rule)
+    hits = sum(_hit(base, continue_branch(state, n, reseed_base + j), rule, state.t, horizon, warmup)
                for j in range(n_branches))
     return hits / n_branches
 
@@ -267,30 +276,32 @@ def splitting_estimate(root, clone, step, score, hit, levels, n_roots: int, spli
 def restart_risk(state: State, rule: incidents.IncidentRule, horizon: int, levels, n_roots: int, split: int,
                  reseed_base: int, warmup: int = incidents.WARMUP, max_paths: int = 2000) -> tuple[float, int]:
     """`branch_risk` by multilevel splitting on A's overdue backlog (`a.queue_overdue` levels)."""
-    if horizon > windows_left(state):
-        raise ValueError(f"horizon {horizon} exceeds the {windows_left(state)} windows left")
+    n = branch_windows(horizon, rule)
+    if n > windows_left(state):
+        raise ValueError(f"{n} branch windows exceed the {windows_left(state)} windows left")
     base = series(state.records)
     root = start_branch(state, None)
     return splitting_estimate(
         root=root, clone=lambda b, r: b.clone(r), step=lambda b: b.step(),
         score=lambda b: b.records[-1]["tel"]["a"]["queue_overdue"],
         hit=lambda b: _hit(base, b.records, rule, state.t, horizon, warmup),
-        levels=levels, n_roots=n_roots, split=split, horizon=horizon, reseed_base=reseed_base,
+        levels=levels, n_roots=n_roots, split=split, horizon=n, reseed_base=reseed_base,
         max_paths=max_paths)
 
 
 # ------------------------------------------------------------------ state sampling
-def sample_states(episodes: list[dict], n: int, horizon: int, warmup: int,
+def sample_states(episodes: list[dict], n: int, horizon: int, warmup: int, tail: int = 0,
                   tag: int = SAMPLE_TAG) -> list[tuple[int, int, str]]:
     """`n` distinct states (episode, window, stratum), sorted; deterministic.
 
     `episodes`: dicts {"episode", "degraded", "onsets" (counted incident onsets), "windows"}. Half the
     states ("pre_onset") come from degraded episodes in the PRE_ONSET_WINDOWS windows before an onset, the
     rest ("uniform") uniformly from all windows; when there are too few pre-onset windows, all are taken
-    and the uniform part fills up. Every state leaves room for `horizon` windows and lies after the warm-up.
+    and the uniform part fills up. Every state leaves room for `horizon` + `tail` windows (the branch length,
+    see `branch_windows`) and lies after the warm-up.
     """
     def ok(e, w):
-        return warmup <= w <= e["windows"] - 1 - horizon
+        return warmup <= w <= e["windows"] - 1 - horizon - tail
 
     pre = sorted({(e["episode"], w) for e in episodes if e["degraded"] for o in e["onsets"]
                   for w in range(o - PRE_ONSET_WINDOWS, o) if ok(e, w)})
