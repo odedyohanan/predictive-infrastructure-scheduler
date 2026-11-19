@@ -25,8 +25,9 @@ Window columns (dots in source names become underscores; the mappings below are 
 `slo_v2_violation` and `deg_active` feed `incidents.label_series(viol, active, rule)` directly.
 
 Episode columns include KNOWN_COLUMNS (`known_<name>`): the parameters known in advance, at their
-start-of-episode values. World-model training pairs (`Store.training_sequences`) take state_t, the policy
-of row t+1 (decided after seeing window t) and these known values as input, and state_{t+1} as target.
+start-of-episode values. World-model training pairs are built by `features.steps` from `Store.training_windows`
+rows (`features.episode_data`): input j = state of window j + the policy of row j+1 (decided after seeing window
+j) + these known values, target = state_{j+1} - state_j.
 """
 from __future__ import annotations
 
@@ -67,8 +68,6 @@ WINDOW_COLUMNS = (["episode", "window", "t"] + list(STATE_COLUMNS.values()) + li
 # episode columns: the parameters every controller and model knows in advance (start-of-episode values)
 KNOWN_COLUMNS = {n: f"known_{n}" for n in KNOWN_NAMES}
 # world-model inputs per step (state, next policy, known; the order of worldmodel.features.INPUT_NAMES)
-INPUT_COLUMNS = list(STATE_COLUMNS.values()) + list(POLICY_COLUMNS.values()) + list(KNOWN_COLUMNS.values())
-TARGET_COLUMNS = list(STATE_COLUMNS.values())
 
 
 # ------------------------------------------------------------------ writing
@@ -181,46 +180,6 @@ class Store:
         return self._df('SELECT * FROM windows WHERE episode IN (SELECT unnest(?)) ORDER BY episode, "window"',
                         [seeds])
 
-    def training_sequences(self, seeds, context: int,
-                           horizon: int) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
-        """Training: world-model-ready sliding sequences inside each episode of the given history seeds.
-
-        For a sequence ending at window t:
-          X [N, context, 75]  step j (window w = t-context+1+j) = state of w + the policy applied in window
-                              w+1 (row w+1's policy_* columns: the decision taken after seeing w) + the known
-                              parameters of the episode; columns INPUT_COLUMNS, the order of
-                              `worldmodel.features.encode_input`
-          Y [N, horizon, 39]  states of windows t+1..t+horizon (TARGET_COLUMNS: state only, no policy)
-        So X[i, -1] holds state_t and the policy that produced state_{t+1} = Y[i, 0]. The policies of
-        later horizon steps are row t+2.. policy_* columns (`window_rows`). The index frame holds (episode,
-        window = t) per sequence. Sequences never cross episodes.
-        """
-        if context < 1 or horizon < 1:
-            raise ValueError("context and horizon must be >= 1")
-        seeds = self._training_seeds(seeds)
-        states, pols = list(STATE_COLUMNS.values()), list(POLICY_COLUMNS.values())
-        df = self._df(f'SELECT episode, "window", {self._cols(states + pols)} FROM windows '
-                      'WHERE episode IN (SELECT unnest(?)) ORDER BY episode, "window"', [seeds])
-        known = self._df(f"SELECT seed, {', '.join(KNOWN_COLUMNS.values())} FROM episodes "
-                         "WHERE seed IN (SELECT unnest(?))", [seeds]).set_index("seed")
-        xs, ys, idx = [], [], []
-        for ep, part in df.groupby("episode", sort=True):
-            s = part[states].to_numpy(dtype=np.float32)
-            p = part[pols].to_numpy(dtype=np.float32)
-            k = known.loc[ep].to_numpy(dtype=np.float32)
-            n = len(s) - context - horizon + 1
-            if n <= 0:
-                continue
-            steps = np.concatenate([s[:-1], p[1:], np.broadcast_to(k, (len(s) - 1, len(k)))], axis=1)
-            for i in range(n):
-                t = i + context - 1
-                xs.append(steps[i:t + 1])
-                ys.append(s[t + 1:t + 1 + horizon])
-                idx.append((int(ep), int(part.window.iloc[t])))
-        x = np.stack(xs) if xs else np.zeros((0, context, len(INPUT_COLUMNS)), np.float32)
-        y = np.stack(ys) if ys else np.zeros((0, horizon, len(TARGET_COLUMNS)), np.float32)
-        return x, y, pd.DataFrame(idx, columns=["episode", "window"])
-
     def _training_seeds(self, seeds) -> list[int]:
         """Calibration, selection and held-out seeds never feed training; every seed must be stored."""
         seeds = [int(s) for s in seeds]
@@ -233,7 +192,11 @@ class Store:
 
     # -------------------------------------------------- inference
     def recent_windows(self, episode: int, upto: int, n: int) -> pd.DataFrame:
-        """Inference: the last `n` window rows of an episode ending at window `upto` (never after it)."""
+        """Inference: the last `n` window rows of an episode ending at window `upto` (never after it).
+
+        The reference query for "rows up to t only": no pipeline script calls it (the shadow run reads whole
+        stored episodes through `window_rows` and cuts them at t itself, the advisor builds its rows live with
+        `features.rows_from_records`); its test pins the no-future contract the predictors rely on."""
         return self._df('SELECT * FROM windows WHERE episode = ? AND "window" <= ? AND "window" > ? '
                         'ORDER BY "window"',
                         [int(episode), int(upto), int(upto) - int(n)])

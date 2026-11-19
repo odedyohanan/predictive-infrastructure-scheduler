@@ -13,7 +13,6 @@ the default output directory. Long runs go through scripts/gentle.sh.
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -24,31 +23,18 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from pis.phase_b import runs  # noqa: E402
 from pis.phase_b import seeds as seed_ranges  # noqa: E402
 from pis.privacy import safe_path  # noqa: E402
 
 DEFAULT_OUT = "data/phase_b/history"
 SHARD_SIZE = 10
-LABELS = ("", "smoke")
 GENERATED = ("HISTORY", "CALIBRATION", "SELECTION")
 
 
-def tree_dirty() -> bool:
-    p = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain"], capture_output=True, text=True)
-    return p.returncode != 0 or bool(p.stdout.strip())
-
-
 def check_seeds(seeds: list[int]) -> None:
-    """Every seed must be a history, calibration or selection seed."""
-    for s in seeds:
-        if s in seed_ranges.HELD_OUT:
-            raise ValueError(f"seed {s} is held out and is never generated here")
-        for name in GENERATED:
-            if s in seed_ranges.RANGES[name]:
-                seed_ranges.check([s], name)
-                break
-        else:
-            seed_ranges.check([s], "HISTORY")      # raises with the reason
+    """Every seed must be a history, calibration or selection seed (held-out and earlier seeds refused)."""
+    runs.check_seeds(seeds, GENERATED)
 
 
 def run_shard(shard, shard_dir: Path, duration_s: float | None) -> None:
@@ -109,7 +95,7 @@ def main(argv=None) -> dict:
         raise SystemExit(f"refusing to run: {e}")
     if len(set(seeds)) != len(seeds):
         raise SystemExit("refusing to run: repeated seeds")
-    if a.label not in LABELS:
+    if a.label not in runs.LABELS:
         raise SystemExit(f"refusing to run: unknown label {a.label!r}")
     smoke = a.label == "smoke"
     if a.duration is not None and not smoke:
@@ -118,7 +104,7 @@ def main(argv=None) -> dict:
         raise SystemExit("refusing to run: --duration must be positive")
     if smoke and Path(a.out).resolve() == (ROOT / DEFAULT_OUT).resolve():
         raise SystemExit("refusing to run: a smoke run never writes into the default output directory")
-    if not smoke and tree_dirty():
+    if not smoke and runs.tree_dirty():
         raise SystemExit("refusing to run: the working tree has uncommitted changes (commit, or --label smoke)")
 
     from pis.phase_b import history, policies

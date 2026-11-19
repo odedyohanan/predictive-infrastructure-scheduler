@@ -203,8 +203,6 @@ def test_training_refuses_non_history(store_root):
     for bad in ([3400], [3460], [3000]):
         with pytest.raises(ValueError):
             st.training_windows(bad)
-        with pytest.raises(ValueError):
-            st.training_sequences(bad, 4, 2)
 
 
 def _synthetic_shard(root, seeds, n=12):
@@ -229,51 +227,11 @@ def _synthetic_shard(root, seeds, n=12):
     return d
 
 
-def test_training_sequences_are_world_model_pairs(tmp_path):
-    _synthetic_shard(tmp_path, [3100, 3101])
-    st = history.Store(tmp_path)
-    x, y, idx = st.training_sequences([3100, 3101], context=4, horizon=2)
-    assert x.shape == (2 * (12 - 4 - 2 + 1), 4, len(history.INPUT_COLUMNS)) == (14, 4, 75)
-    assert y.shape == (14, 2, 39)
-    assert history.INPUT_COLUMNS == ([history.STATE_COLUMNS[n] for n in STATE_NAMES]
-                                     + [history.POLICY_COLUMNS[n] for n in POLICY_NAMES]
-                                     + [history.KNOWN_COLUMNS[n] for n in history.KNOWN_NAMES])
-    assert not [c for c in history.TARGET_COLUMNS if c.startswith("policy_")]
-    share = history.INPUT_COLUMNS.index("policy_share_A")
-    state0 = history.INPUT_COLUMNS.index("a_rate")
-    known = [history.INPUT_COLUMNS.index(c) for c in history.KNOWN_COLUMNS.values()]
-    for i, (ep, t) in enumerate(zip(idx.episode, idx.window)):
-        assert x[i, -1, state0] == 100 * ep + t                          # state_t
-        assert x[i, -1, share] == pytest.approx((t + 1) / 100)           # row t+1's policy
-        np.testing.assert_allclose(x[i, :, state0], 100 * ep + np.arange(t - 3, t + 1))
-        np.testing.assert_allclose(x[i, :, share], np.arange(t - 2, t + 2) / 100, rtol=1e-6)
-        np.testing.assert_allclose(x[i][:, known], np.tile([1.0, 2.0, 3.0], (4, 1)))
-        np.testing.assert_allclose(y[i, :, 0], 100 * ep + np.array([t + 1, t + 2]))
-    assert list(idx[idx.episode == 3100].window) == list(range(3, 10))     # t + horizon <= 11
-
-
-def test_training_sequences_real_episodes(store_root):
-    root, eps = store_root
-    st = history.Store(root)
-    x, y, idx = st.training_sequences([3100, 3101], context=4, horizon=2)
-    n = sum(len(recs) - 4 - 2 + 1 for _, recs in eps.values())
-    assert x.shape == (n, 4, 75) and y.shape == (n, 2, 39) and len(idx) == n
-    sc, recs = eps[3101]
-    i = int(np.flatnonzero((idx.episode == 3101).to_numpy() & (idx.window == 5).to_numpy())[0])
-    from worldmodel.features import encode_input
-    from pis.adapters import known_of
-    want = np.stack([encode_input(encode_state(recs[w]["tel"]), recs[w + 1]["applied"], known_of(sc.spec))
-                     for w in range(2, 6)])
-    np.testing.assert_allclose(x[i], want, rtol=1e-5)
-    np.testing.assert_allclose(y[i], np.stack([encode_state(recs[w]["tel"]) for w in (6, 7)]), rtol=1e-6)
-
-
 def test_training_refuses_missing_seeds(tmp_path):
     _synthetic_shard(tmp_path, [3100, 3101])
     st = history.Store(tmp_path)
-    for call in (lambda s: st.training_windows(s), lambda s: st.training_sequences(s, 2, 1)):
-        with pytest.raises(ValueError, match="3102"):
-            call([3100, 3102])
+    with pytest.raises(ValueError, match="3102"):
+        st.training_windows([3100, 3102])
 
 
 def test_store_refuses_held_out(tmp_path):
@@ -361,7 +319,7 @@ def test_script_refuses_bad_arguments(tmp_path):
 
 
 def test_script_refuses_dirty_tree(tmp_path, monkeypatch):
-    monkeypatch.setattr(gen, "tree_dirty", lambda: True)
+    monkeypatch.setattr(gen.runs, "tree_dirty", lambda ignore=(): True)
     with pytest.raises(SystemExit):
         gen.main(["--seeds", "3100", "--out", str(tmp_path / "h")])
 
@@ -376,3 +334,16 @@ def test_script_rerun_skips_done(tmp_path, capsys):
     st = history.Store(tmp_path / "h")
     assert sorted(st.episodes().seed) == [3100, 3101]
     assert (st.episodes().wall_s > 0).all()
+
+
+def test_training_sequences_removed():
+    assert not hasattr(history.Store, "training_sequences")
+    assert not hasattr(history, "INPUT_COLUMNS") and not hasattr(history, "TARGET_COLUMNS")
+
+
+def test_generator_uses_the_shared_guards():
+    assert not hasattr(gen, "tree_dirty") and not hasattr(gen, "LABELS")
+    for bad in ([3000], [1100], [2050]):
+        with pytest.raises(ValueError):
+            gen.check_seeds(bad)
+    gen.check_seeds([3100, 3420, 3460])

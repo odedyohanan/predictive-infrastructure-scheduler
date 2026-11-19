@@ -38,7 +38,7 @@ def _policies(n):
 
 
 def _strip(tel):
-    return {k: v for k, v in tel.items() if k != "phase_b"}
+    return {k: v for k, v in tel.items() if k not in ("phase_b", "hardware")}
 
 
 class Fixed:
@@ -80,6 +80,7 @@ def test_no_degradation_is_identical():
         assert _strip(a) == b
         assert a["phase_b"] == {"kind": "none", "active": False, "factor": 0.0,
                                 "alive_cpus": list(range(8))}
+        assert a["hardware"] == {"alive_cpus": list(range(8)), "alive_gpus": [0, 1]}
     assert ds.sim.spec is sc.spec
     assert ds.done() and plain.done()
 
@@ -260,3 +261,109 @@ def test_run_episode_matches_harness_without_degradation():
     mine = run_episode(sc, BaseGreedyController(sc.spec), "r6")
     ref = run_scenario(seed, BaseGreedyController(sc.spec), duration_s=10.0)
     assert [(_strip(r["tel"]), r["policy"]) for r in mine] == [(r["tel"], r["policy"]) for r in ref]
+
+
+class WithDsim(Fixed):
+    def __init__(self, policy):
+        super().__init__(policy)
+        self.dsims, self.sims = [], []
+
+    def attach_dsim(self, dsim):
+        self.dsims.append(dsim)
+
+    def attach_sim(self, sim):
+        self.sims.append(sim)
+
+
+def test_run_episode_attaches_degraded_sim():
+    sc = _scenario("cpu_loss", onset=1.0, duration=3.0)
+    pol = adapters.initial_policy()
+    ctl = WithDsim(pol)
+    recs = run_episode(sc, ctl, "fixed")
+    assert len(ctl.dsims) == 1 and isinstance(ctl.dsims[0], DegradedSim)
+    assert ctl.sims == [ctl.dsims[0].sim]                     # the same running simulator
+    assert ctl.dsims[0].scenario is sc and ctl.dsims[0].done()
+    plain = run_episode(sc, Fixed(pol), "fixed")             # behaviour without the hook is unchanged
+    assert [r["tel"] for r in plain] == [r["tel"] for r in recs]
+
+
+@pytest.mark.parametrize("kind, cpus, gpus", [("cpu_loss", [0, 1, 4, 5, 6, 7], [0, 1]),
+                                               ("gpu_loss", list(range(8)), [1])])
+def test_hardware_visible_to_controllers(kind, cpus, gpus):
+    sc = _scenario(kind, onset=2.0, duration=4.0)
+    ctl = Fixed(adapters.initial_policy())
+    recs = run_episode(sc, ctl, "fixed")
+    for seen, r in zip(ctl.seen, recs):
+        assert "phase_b" not in seen                             # drift stays hidden
+        dead = r["tel"]["phase_b"]["active"]
+        assert seen["hardware"] == ({"alive_cpus": cpus, "alive_gpus": gpus} if dead
+                                    else {"alive_cpus": list(range(8)), "alive_gpus": [0, 1]})
+    assert any(r["tel"]["phase_b"]["active"] for r in recs) and not recs[0]["tel"]["phase_b"]["active"]
+
+
+class _Unaware:
+    """R6 fed telemetry without the hardware key."""
+    def __init__(self, spec):
+        from pis.harness import BaseGreedyController
+        self.inner = BaseGreedyController(spec)
+
+    def decide(self, tel, current, history):
+        return self.inner.decide(_strip(tel), current, [(_strip(t), p) for t, p in history])
+
+
+def test_hardware_key_does_not_change_r6():
+    from pis.harness import BaseGreedyController
+    sc = _scenario("cpu_loss", onset=2.0, duration=6.0)
+    a = run_episode(sc, BaseGreedyController(sc.spec), "r6")
+    b = run_episode(sc, _Unaware(sc.spec), "r6")
+    assert [r["policy"] for r in a] == [r["policy"] for r in b]
+    assert [_strip(r["tel"]) for r in a] == [_strip(r["tel"]) for r in b]
+
+
+def test_hardware_key_leaves_features_and_store_rows():
+    from pis.phase_b import features, history
+    sc = _scenario("cpu_loss", onset=2.0, duration=4.0)
+    recs = run_episode(sc, Fixed(adapters.initial_policy()), "fixed")
+    bare = [{**r, "tel": {k: v for k, v in r["tel"].items() if k != "hardware"}} for r in recs]
+    k = adapters.known_of(sc.spec)
+    np.testing.assert_array_equal(features.encode_records(recs, k).states, features.encode_records(bare, k).states)
+    assert history.window_frame(sc, recs, "fixed").equals(history.window_frame(sc, bare, "fixed"))
+
+
+def _mid_burst_sim():
+    """A full-length scenario whose clock sits inside a burst (the rest of the state is irrelevant)."""
+    ds = DegradedSim(scenarios.scenario_for(3400))
+    b = ds.sim.bursts
+    i = int(np.argmax(b > 20.0))
+    assert b[i] > 20.0 and i + 1 < len(b)
+    ds.sim.t = float(b[i]) + 0.5 * ds.sim.spec.a.burst_len      # burst i is ongoing
+    return ds, i
+
+
+def test_reseeded_clone_redraws_future_bursts():
+    ds, i = _mid_burst_sim()
+    a, b = ds.clone(reseed=11), ds.clone(reseed=12)
+    t = ds.sim.t
+    for c in (a, b):
+        assert np.array_equal(c.sim.bursts[c.sim.bursts <= t], ds.sim.bursts[:i + 1])   # past and ongoing kept
+        assert np.all(np.diff(c.sim.bursts) > 0) and c.sim.bursts[-1] < c.sim.duration
+    assert not np.array_equal(a.sim.bursts[a.sim.bursts > t], b.sim.bursts[b.sim.bursts > t])
+    assert not np.array_equal(a.sim.bursts[a.sim.bursts > t], ds.sim.bursts[i + 1:])
+    assert np.array_equal(ds.clone(reseed=11).sim.bursts, a.sim.bursts)                # same reseed, same bursts
+
+
+def test_clone_without_reseed_keeps_bursts():
+    ds, _ = _mid_burst_sim()
+    assert np.array_equal(ds.clone().sim.bursts, ds.sim.bursts)
+
+
+def test_redrawn_burst_gaps_follow_the_spec():
+    ds, _ = _mid_burst_sim()
+    t = ds.sim.t
+    gaps = []
+    for r in range(300):
+        f = ds.clone(reseed=r).sim.bursts
+        f = f[f > t]
+        if len(f):
+            gaps += [f[0] - t] + list(np.diff(f))
+    assert np.mean(gaps) == pytest.approx(ds.sim.spec.a.burst_every, rel=0.15)

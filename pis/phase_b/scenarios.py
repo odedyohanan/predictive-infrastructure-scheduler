@@ -4,7 +4,9 @@ A scenario is an ordinary randomised spec plus at most one degradation that star
 grows linearly to full strength over `ramp_s` (CPU and GPU loss are steps). The degradation is applied
 by `DegradedSim`, which replaces `sim.spec` (frozen dataclass) before each window and masks the policy
 for lost CPUs and GPUs. The scenario's own `spec` is never touched, so the parameters controllers know
-in advance stay at the episode's start values: drift is not announced.
+in advance stay at the episode's start values: drift is not announced. Dead hardware is observable: the
+telemetry carries a visible "hardware" block (alive CPUs and GPUs in the window) next to the hidden
+"phase_b" block that controllers never see.
 """
 from __future__ import annotations
 
@@ -155,17 +157,40 @@ class DegradedSim:
         applied = mask_policy(policy, dead, d.dead_gpus(t), self.sim.n_cpus)
         self.last_applied = applied
         tel = self.sim.run_window(policy_from_dict(applied))
-        tel["phase_b"] = {"kind": d.kind, "active": d.active(t), "factor": f,
-                          "alive_cpus": [k for k in range(self.sim.n_cpus) if k not in dead]}
+        alive = [k for k in range(self.sim.n_cpus) if k not in dead]
+        tel["phase_b"] = {"kind": d.kind, "active": d.active(t), "factor": f, "alive_cpus": alive}
+        tel["hardware"] = {"alive_cpus": list(alive),
+                           "alive_gpus": [g for g in range(self.sim.n_gpus) if g not in d.dead_gpus(t)]}
         return tel
 
     def done(self) -> bool:
         return self.sim.done()
 
     def clone(self, reseed: int | None = None) -> "DegradedSim":
-        """Independent copy that keeps the schedule; `reseed` makes its future randomness differ."""
+        """Independent copy that keeps the degradation schedule.
+
+        `reseed` makes the whole future random: arrivals and service times, and A's bursts too. The
+        simulator draws every burst start of the episode up front, so a reseeded copy keeps the bursts
+        that started by now (past and ongoing) and redraws the later ones from the new generator (a Poisson
+        process restarted at the current time: exact, as the gaps are memoryless). Without `reseed` the copy
+        is identical.
+        """
         c = copy.copy(self)
         c.sim = clone_sim(self.sim, reseed)
         c.last_applied = copy.deepcopy(self.last_applied)
+        if reseed is not None:
+            c.sim.bursts = redraw_bursts(c.sim)
         return c
+
+
+def redraw_bursts(sim) -> np.ndarray:
+    """Burst starts <= sim.t kept, later ones drawn from sim.rng with the spec's mean gap."""
+    kept = [float(b) for b in sim.bursts if b <= sim.t]
+    t = sim.t
+    while True:
+        t += sim.rng.exponential(sim.spec.a.burst_every)
+        if t >= sim.duration:
+            break
+        kept.append(t)
+    return np.array(kept)
 
