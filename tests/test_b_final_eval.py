@@ -20,6 +20,12 @@ def fe():
     return load_script("b_final_eval")
 
 
+@pytest.fixture(autouse=True)
+def _primary_from_shadow(fe, monkeypatch):
+    """The stand-in shadow runs have no store: question 1's primary predictor is given."""
+    monkeypatch.setattr(fe, "primary_predictor", lambda shadow_cfg, names, root=None: "world_model")
+
+
 # ------------------------------------------------------------------ protocol files
 def _files(tmp, gate="GATE: pass", advisor=True):
     """Stand-in configs, notes and shadow outputs; returns the paths make_protocol takes."""
@@ -408,6 +414,13 @@ def test_rehearsal_end_to_end(fe, tmp_path, monkeypatch):
     text = out.read_text()
     assert "## Attempt 1 (smoke)" in text and "(started)" not in text and "Projected" in text
     assert (raw / "attempt_1" / "run_config.json").exists()
+    att = raw / "attempt_1"
+    assert (att / fe.PRIMARY_FILE).exists() and (att / fe.ORACLE_SHARDS / "s0000" / "done").exists()
+    primary = json.loads((att / fe.SHARDS / "s0000" / fe.EPISODES_FILE).read_text())
+    assert {e["arm"] for e in primary} == set(fe.PRIMARY_ARMS)                 # the oracle runs on its own
+    assert (att / fe.ORACLE_SHARDS / "s0000" / "done").stat().st_mtime >= \
+        (att / fe.SHARDS / "s0000" / "done").stat().st_mtime
+    assert "Diagnostic oracle arm" in text and "| advisor_oracle |" in text
     with pytest.raises(SystemExit) as e:                           # never overwritten
         fe.main(argv)
     assert "refusing" in str(e.value)
@@ -538,3 +551,71 @@ def test_live_rows_give_the_store_risks():
     b = shadow.episode_risks(preds[1], names, live.iloc[:PROBE_WINDOWS], rule["H"], rule["warmup"], PROBE_SEED)
     for n in names:
         np.testing.assert_allclose(b[n], a[n], rtol=0, atol=1e-9, err_msg=n)
+
+
+# ------------------------------------------------------------------ oracle sizing and the primary predictor
+def test_protocol_oracle_fields_and_primary_predictor(fe, tmp_path):
+    p = fe.make_protocol(_files(tmp_path))
+    assert p["oracle"]["branches"] == 4 and p["oracle"]["horizon"] == 6            # h of the advisor config
+    q1 = p["success_rule"]["question_1"]
+    assert q1["primary"] == "world_model" and q1["secondary"] == []
+    p2 = fe.make_protocol(_files(tmp_path / "b"), oracle_branches=2, oracle_horizon=3)
+    assert p2["oracle"]["branches"] == 2 and p2["oracle"]["horizon"] == 3
+    assert any("oracle" in e for e in fe.validate_protocol({**p, "oracle": None}))
+    bad = json.loads(json.dumps(p))
+    bad["success_rule"]["question_1"]["primary"] = "queueing"
+    assert any("primary" in e for e in fe.validate_protocol(bad))
+    with pytest.raises(ValueError):
+        fe.make_protocol(_files(tmp_path / "c"), oracle_branches=0)
+    shadow_only = fe.make_protocol(_files(tmp_path / "d", gate="GATE: stop before prevention", advisor=False))
+    assert shadow_only["oracle"] is None and fe.validate_protocol(shadow_only) == []
+
+
+def test_choose_primary_best_selection_recall_then_false_alarms(fe):
+    def r(recall, fa, thr=0.5):
+        return {"threshold": thr, "selection": {"by_cause": {"building_up": {"recall": recall}},
+                                                "false_alarm_rate": fa}}
+    res = {"world_model": r(0.4, 0.08), "hazard": r(0.6, 0.09), "analogue": r(0.6, 0.05), "queueing": r(0.9, 0.0)}
+    assert fe.choose_primary(res, ["world_model", "hazard", "analogue"]) == "analogue"     # tie -> lower FA
+    res["analogue"] = r(0.6, 0.05, thr=None)                                                # infeasible = 0
+    assert fe.choose_primary(res, ["world_model", "hazard", "analogue"]) == "hazard"
+    assert fe.choose_primary(res, []) is None
+
+
+def test_question_one_success_is_judged_on_the_primary_only(fe):
+    risks, labels, active = _risk_case()
+    for e in risks:                                     # hazard: as good as the world model
+        risks[e]["hazard"] = risks[e]["world_model"].copy()
+    for e in range(3000, 3010):                         # world model fails on held-out
+        risks[e]["world_model"] = np.where(np.isnan(risks[e]["world_model"]), np.nan, 0.5)
+    names = ["world_model", "hazard", "queueing"]
+    cal, out = list(range(3400, 3410)), list(range(3000, 3010))
+    q = fe.question_one(risks, labels, active, names, cal, out, RULE, primary="world_model")
+    assert q["verdict"]["hazard"] is True and q["primary_above"] is False
+    p = {"success_rule": {"question_2": "not attempted"}, "files": {"shadow_note": {"path": "x"}}}
+    q2 = fe.question_two([e for e in _episodes() if e["arm"] == "r6"], ["r6"], "not attempted", None)
+    text = fe.report_text(p, {"title": "Attempt 1"}, q2, q, None, [])
+    assert "**Question 1: not met (world_model" in text and "secondary (no success claim)" in text
+    good = fe.question_one(risks, labels, active, names, cal, out, RULE, primary="hazard")
+    assert good["primary_above"] is True
+    assert "**Question 1: SUCCESS (hazard" in fe.report_text(p, {"title": "A"}, q2, good, None, [])
+
+
+def test_oracle_projection_from_tuning_raw(fe, tmp_path):
+    d = tmp_path / "tune" / "s0000"
+    d.mkdir(parents=True)
+    eps = [{"seed": 3450, "arm": "r6", "seconds": 6.0, "windows": 600, "mode_share": 0.0},
+           {"seed": 3450, "arm": "eps0.05_n8", "seconds": 9.0, "windows": 600, "mode_share": 0.1},
+           {"seed": 3451, "arm": "eps0.05_n8", "seconds": 9.0, "windows": 600, "mode_share": 0.3}]
+    (d / "episodes.json").write_text(json.dumps(eps))
+    (d / "done").write_text("")
+    adv = {"chosen": "eps0.05_n8", "params": {"m": 4, "h": 20}}
+    proj = fe.oracle_projection(tmp_path / "tune", adv, RULE, branches=4, horizon=20, n_seeds=100)
+    from pis.adapters import initial_policy
+    from pis.probe import named_interventions
+    cands = 1 + 4 + len(named_interventions(initial_policy()))
+    want_s = 0.2 * 600 * cands * 4 * (20 + 3 - 1) * 0.01
+    assert proj["mode_share_mean"] == pytest.approx(0.2) and proj["mode_share_max"] == pytest.approx(0.3)
+    assert proj["one_proc_h"] == pytest.approx(100 * want_s / 3600)
+    assert proj["four_procs_h"] == pytest.approx(proj["one_proc_h"] / 4)
+    assert fe.oracle_projection(tmp_path / "none", adv, RULE, 4, 20) is None

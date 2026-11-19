@@ -315,3 +315,30 @@ def test_only_the_oracle_keeps_the_simulator():
     ctl = _ctrl(sc, [0.9], selection="oracle", params=_params(h=2), oracle_branches=1)
     run_episode(sc, ctl, "advisor")
     assert ctl.sim is not None and ctl.dsim is not None
+
+
+def test_oracle_branches_and_horizon_are_configurable(monkeypatch):
+    sc = _scenario(4.0)
+    runs = []
+    orig = scenarios.DegradedSim.clone
+
+    def counting_clone(self, *a, **kw):
+        c = orig(self, *a, **kw)
+        n = {"windows": 0}
+        runs.append(n)
+        inner = c.run_window
+
+        def run_window(p, _inner=inner, _n=n):
+            _n["windows"] += 1
+            return _inner(p)
+        c.run_window = run_window
+        return c
+    monkeypatch.setattr(scenarios.DegradedSim, "clone", counting_clone)
+    ctl = _ctrl(sc, [0.9], selection="oracle", params=_params(h=5), oracle_branches=2, oracle_horizon=2)
+    recs = run_episode(sc, ctl, "advisor")
+    on = [r["info"] for r in recs if r["info"]["mode"]]
+    assert on and runs
+    assert {r["windows"] for r in runs[:2]} == {2 + RULE.k - 1}                 # horizon 2 + the k - 1 tail
+    assert len(runs) == sum(2 * i["n_candidates"] for i in on if i["reason"] != "episode_end")
+    with pytest.raises(ValueError):
+        _ctrl(sc, [0.9], selection="oracle", oracle_branches=0)

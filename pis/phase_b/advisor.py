@@ -26,7 +26,8 @@ pred_incident_p (the chosen candidate's predicted probability, R6 greedy's on a 
 mode, for random selection and when the model was not consulted) and n_candidates.
 
 Selection arms on the same candidates: "model" (the above), "random" (uniform choice in the mode),
-"oracle" (the real degraded simulator, branched `oracle_branches` times per candidate, true values and
+"oracle" (the real degraded simulator, branched `oracle_branches` times per candidate and judged over
+`oracle_horizon` windows (default h), true values and
 true onset shares, same rule; needs `attach_dsim`; only this selection keeps the simulator), "always"
 (the mode on in every window from the warm-up on, never before it, without the alarm).
 """
@@ -192,7 +193,8 @@ class _Rows:
 class AdvisorController:
     def __init__(self, spec, predictor, alarms_cfg: dict, model, params: AdvisorParams, selection: str = "model",
                  *, rule: incidents.IncidentRule, warmup: int = incidents.WARMUP, seed: int = 0,
-                 base_ckpt: str = BASE_CKPT, oracle_branches: int = ORACLE_BRANCHES, duration_s: float | None = None):
+                 base_ckpt: str = BASE_CKPT, oracle_branches: int = ORACLE_BRANCHES, oracle_horizon: int | None = None,
+                 duration_s: float | None = None):
         if selection not in SELECTIONS:
             raise ValueError(f"selection must be one of {SELECTIONS}")
         self.spec, self.predictor, self.model, self.params = spec, predictor, model, params
@@ -204,6 +206,9 @@ class AdvisorController:
         if self.threshold is not None and (self.low is None or self.low > self.threshold):
             raise ValueError("the alarm needs low <= threshold")
         self.oracle_branches = int(oracle_branches)
+        self.oracle_horizon = None if oracle_horizon is None else int(oracle_horizon)
+        if self.oracle_branches < 1 or (self.oracle_horizon is not None and self.oracle_horizon < 1):
+            raise ValueError("the oracle needs at least one branch and one window")
         self.base = BaseScheduler(base_ckpt, spec)
         self.known = known_params(spec)
         self.rng = np.random.default_rng(seed)                     # R6 samples
@@ -303,7 +308,7 @@ class AdvisorController:
         left = int(round(sc.duration_s / sc.spec.policy_period_s)) - self.rows.n
         if left < 1:
             return -1, "episode_end", None
-        h = min(p.h, left)
+        h = min(p.h if self.oracle_horizon is None else self.oracle_horizon, left)
         m = min(h + self.rule.k - 1, left)
         v0 = np.array(self.rows.viol, dtype=bool)
         states = np.empty((len(cands), self.oracle_branches, h, N_WM), dtype=np.float32)

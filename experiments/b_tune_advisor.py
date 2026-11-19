@@ -103,13 +103,17 @@ class _NoRisk:
 
 
 def make_advisor(stack: dict, spec, seed: int, alarms: dict, inc: dict, params, selection: str = "model",
-                 duration_s: float = DURATION_S):
+                 duration_s: float = DURATION_S, oracle_branches: int | None = None,
+                 oracle_horizon: int | None = None):
     from pis.phase_b.advisor import AdvisorController
     pred = stack["predictor"] or _NoRisk()
     if stack["predictor"] is not None:
         stack["for_episode"]({stack["predictor_name"]: pred}, seed)
+    from pis.phase_b.advisor import ORACLE_BRANCHES
     return AdvisorController(spec, pred, alarms, stack["model"], params, selection, rule=rule_of(inc),
-                             warmup=int(inc["warmup"]), seed=seed, duration_s=duration_s)
+                             warmup=int(inc["warmup"]), seed=seed, duration_s=duration_s,
+                             oracle_branches=ORACLE_BRANCHES if oracle_branches is None else oracle_branches,
+                             oracle_horizon=oracle_horizon)
 
 
 def scenario(seed: int, duration_s: float):

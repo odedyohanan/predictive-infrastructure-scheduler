@@ -4,7 +4,8 @@ configs/phase_b/final_eval.json.
 Official run (once; a crash or a bug: fix it, rerun as --attempt 2, report every attempt, never tune on the
 results; an interrupted attempt continues with --resume after its "(started)" section is committed):
   scripts/gentle.sh b_final_eval .venv/bin/python experiments/b_final_eval.py --procs 4
-Freezing the protocol (writes the file once from the committed configs and notes; commit it on its own):
+Freezing the protocol (writes the file once from the committed configs and notes; commit it on its own;
+prints the oracle arm's projected cost from the tuning run's mode shares):
   .venv/bin/python experiments/b_final_eval.py --write-protocol
 Rehearsal on development seeds (stand-in configs; never touches the official outputs):
   .venv/bin/python experiments/b_final_eval.py --write-protocol --protocol <smoke>/final_eval.json \\
@@ -12,10 +13,12 @@ Rehearsal on development seeds (stand-in configs; never touches the official out
   .venv/bin/python experiments/b_final_eval.py --protocol <smoke>/final_eval.json --seeds 3450-3452 \\
       --duration 30 --label rehearsal --out <smoke>/final.md --raw-dir <smoke>/final_raw --procs 1
 
-Every seed runs every arm of the protocol on `scenario_for(seed)` (same scenario, same start policy) inside one
-shard of SHARD_SIZE seeds, so pairs never straddle shards: r6 (the reference), advisor (model selection with
-the tuned params), loop_a (the Step A loop), advisor_random, advisor_oracle and always_on (the advisor's
-selections; "always" has the mode on in every window from the warm-up on). Held-out episodes never enter the
+Every seed runs every primary arm of the protocol on `scenario_for(seed)` (same scenario, same start policy)
+inside one shard of SHARD_SIZE seeds: r6 (the reference), advisor (model selection with the tuned params),
+loop_a (the Step A loop), advisor_random and always_on (the advisor's selections; "always" has the mode on in
+every window from the warm-up on). The primary result is written to the raw directory before the diagnostic
+advisor_oracle arm (real-simulator branches, the protocol's `oracle` branches and horizon) runs in its own
+shards; the oracle never enters a success rule. Held-out episodes never enter the
 history store. Per arm and seed the raw output keeps time in incident, counted incidents (by cause: onset while
 a degradation is active = building-up, otherwise sudden), value per second, SLO v2 %, decision time, the
 intervention rate (share of windows in mode), the fallback share, non-finite risks, and the per-window
@@ -27,9 +30,11 @@ the paired 95 % CI upper bound of (advisor - R6) time in incident over the non-c
 the paired 95 % lower bound of (advisor - R6) value per second over all episodes is at least -1 % of R6's mean
 value per second, and the committed timing note (experiments/b_time_advisor.py: unlabelled, same params,
 alarm and world model, committed at HEAD) has p95 <= 50 ms and max <= 500 ms. Chronic episodes are reported
-separately; decision times measured in this run (background priority) are reported only. Question 1: each
-learned predictor's building-up recall (lead >= min lead) minus the better non-learned one's on the held-out
-R6 episodes, 95 % bootstrap interval over episodes (tag 14000, 2000 resamples) above zero; alarm thresholds
+separately; decision times measured in this run (background priority) are reported only. Question 1: the
+protocol's primary learned predictor (best building-up recall on the shadow run's selection episodes) has a
+building-up recall (lead >= min lead) above the better non-learned one's on the held-out R6 episodes, 95 %
+bootstrap interval over episodes (tag 14000, 2000 resamples) above zero; the other learned predictors are
+secondary (reported, no success claim); alarm thresholds
 are the conformal ones of the shadow run's calibration episodes, never refitted here. The shadow-only
 variant (the shadow run's gate stopped before prevention) runs r6 alone and does not attempt question 2.
 
@@ -82,6 +87,9 @@ OFFICIAL_FILES = {**{k: v for k, v in INPUTS.items() if k != "shadow_dir"},
 TRACKED = ("incident", "alarms", "advisor", "timing_note", "shadow_note", "step_a", "phase_a_protocol")
 ARMS = ("r6", "advisor", "loop_a", "advisor_random", "advisor_oracle", "always_on")
 SHADOW_ARMS = ("r6",)
+ORACLE_ARM = "advisor_oracle"
+PRIMARY_ARMS = tuple(a for a in ARMS if a != ORACLE_ARM)
+ORACLE_BRANCHES = 4
 SELECTION_OF = {"advisor": "model", "advisor_random": "random", "advisor_oracle": "oracle", "always_on": "always"}
 REFERENCE = "r6"
 GATE_STOP, GATE_PASS = "GATE: stop before prevention", "GATE: pass"
@@ -96,7 +104,9 @@ ALARM_KEYS = ("predictor", "threshold", "low", "H")
 RULE_KEYS = ("k", "interval", "majority", "warmup")
 CAUSES = ("building_up", "sudden")
 EPISODES_FILE, ROWS_FILE, RISKS_FILE = "episodes.json", "rows.parquet", "risks.parquet"
-SHARDS = "shards"
+SHARDS, ORACLE_SHARDS = "shards", "oracle_shards"
+PRIMARY_FILE = "primary_result.json"
+DEFAULT_TUNE_DIR = "results/raw/phase_b/advisor_tune"
 
 
 # ------------------------------------------------------------------ files and git
@@ -187,9 +197,13 @@ def _gate(note: Path) -> str:
     raise ValueError(f"{safe_path(str(note))} has no GATE line (missing or not a shadow note)")
 
 
-def make_protocol(paths: dict | None = None, root: Path = ROOT) -> dict:
+def make_protocol(paths: dict | None = None, root: Path = ROOT, oracle_branches: int = ORACLE_BRANCHES,
+                  oracle_horizon: int | None = None) -> dict:
     """The frozen protocol (written once to configs/phase_b/final_eval.json and committed on its own). `paths`
-    replaces the official input files (rehearsals only). Raises ValueError when an input is missing or unusable."""
+    replaces the official input files (rehearsals only). The oracle arm branches `oracle_branches` times over
+    `oracle_horizon` windows (default: the advisor's h). The primary learned predictor of question 1 is read
+    from the shadow run's results (`primary_predictor`). Raises ValueError when an input is missing or
+    unusable."""
     p = {**INPUTS, **{k: str(v) for k, v in (paths or {}).items() if v is not None}}
     variant = _gate(_abs(p["shadow_note"], root))
     inc = load_json(_abs(p["incident"], root))
@@ -214,17 +228,30 @@ def make_protocol(paths: dict | None = None, root: Path = ROOT) -> dict:
         if sha is None:
             raise ValueError(f"{key} file {safe_path(path)} is missing")
         files[key] = {"path": path, "sha256": sha}
+    oracle = None
     if variant == "full":
         adv = load_json(_abs(p["advisor"], root))
         alarms = load_json(_abs(p["alarms"], root))
         if not adv.get("params"):
             raise ValueError("the advisor config has no chosen params")
+        horizon = int(adv["params"]["h"] if oracle_horizon is None else oracle_horizon)
+        if int(oracle_branches) < 1 or horizon < 1:
+            raise ValueError("the oracle needs at least one branch and one window")
+        oracle = {"branches": int(oracle_branches), "horizon": horizon,
+                  "role": "diagnostic upper bound only: runs in its own shards after every primary arm has "
+                          "finished, never part of a success rule"}
         if alarms.get("predictor") is None or alarms.get("threshold") is None:
             raise ValueError("the alarms config has no predictor with a threshold")
     else:
         files.update(advisor=None, timing_note=None)
     names = list(shadow_cfg["names"])
     shadow = runs.load_script("b_shadow")
+    ml = [n for n in shadow.ML if n in names]
+    if not ml:
+        raise ValueError("the shadow run scored no learned predictor")
+    primary = primary_predictor({**shadow_cfg, "_dir": p["shadow_dir"]}, names, root)
+    if primary not in ml:
+        raise ValueError(f"the primary predictor {primary!r} is not a learned one")
     arms_doc = {
         "r6": "reference: the R6 RL student, greedy (models/rl_r6/final.pt of the scheduler repo)",
         "advisor": "candidate: R6 until the alarm, then the chance-constrained model selection with the "
@@ -261,6 +288,7 @@ def make_protocol(paths: dict | None = None, root: Path = ROOT) -> dict:
                     "announced to any controller; 500 ms windows; every arm starts from the same policy",
         "reference_arm": REFERENCE,
         "arms": arms,
+        "oracle": oracle,
         "shard_size": SHARD_SIZE,
         "files": files,
         "predictors": {"names": names, "ml": [n for n in shadow.ML if n in names],
@@ -281,12 +309,17 @@ def make_protocol(paths: dict | None = None, root: Path = ROOT) -> dict:
                                       "realised outcome (a new counted onset within H)"},
         "success_rule": {
             "question_2": q2,
-            "question_1": {"names": names, "ml": [n for n in shadow.ML if n in names],
+            "question_1": {"names": names, "ml": ml,
                            "non_ml": [n for n in shadow.NON_ML if n in names], "cause": "building_up",
                            "min_lead_windows": int(inc["min_lead_windows"]),
-                           "rule": "for each learned predictor, held-out building-up recall minus that of the "
-                                   "better non-learned predictor; the bootstrap 95% interval over episodes lies "
-                                   "above zero",
+                           "primary": primary, "secondary": [n for n in ml if n != primary],
+                           "primary_choice": "the learned predictor with the best building-up recall on the "
+                                             "shadow run's SELECTION episodes (ties: lower false-alarm rate), "
+                                             "fixed before any held-out run",
+                           "rule": "the primary learned predictor's held-out building-up recall minus that of the "
+                                   "better non-learned predictor; success when the bootstrap 95% interval over "
+                                   "episodes lies above zero. The other learned predictors are secondary: their "
+                                   "intervals are reported, no success is claimed for them",
                            "bootstrap": {"reps": alarm_mod.BOOT_REPS, "tag": alarm_mod.BOOT_TAG, "conf": CONF}},
             "not_decidable": "question 2 is not decidable (never a success) when any r6 or advisor run of the "
                              "attempt failed; question 1 is not decidable when any r6 run or its predictor "
@@ -298,6 +331,56 @@ def make_protocol(paths: dict | None = None, root: Path = ROOT) -> dict:
                             "the next attempt, report every attempt; no tuning on these results.",
         "outputs": {"report": OFFICIAL_REPORT, "raw": OFFICIAL_RAW + "/attempt_<N>/"},
     }
+
+
+def choose_primary(res: dict, ml) -> str | None:
+    """The learned predictor with the best selection building-up recall (ties: lower false-alarm rate, then
+    name), from `b_shadow.evaluate` results."""
+    shadow = runs.load_script("b_shadow")
+    ok = [n for n in ml if n in res]
+    return min(ok, key=lambda n: (-shadow._recall(res, n), shadow._fa(res, n), n)) if ok else None
+
+
+def primary_predictor(shadow_cfg: dict, names, root: Path = ROOT) -> str | None:
+    """Question 1's primary predictor from the shadow run: its risks and the store's labels of its calibration
+    and selection episodes, scored as the shadow run scores them."""
+    shadow = runs.load_script("b_shadow")
+    cal = [int(e) for e in shadow_cfg["calibration"]]
+    sel = [int(e) for e in shadow_cfg["selection"]]
+    risks, labels, active = shadow_inputs(shadow_cfg, names, cal + sel, root)
+    res = shadow.evaluate(risks, labels, active, [n for n in shadow.ALL if n in names], cal, sel,
+                          shadow_cfg["rule"], None)
+    return choose_primary(res, [n for n in shadow.ML if n in names])
+
+
+def oracle_projection(tune_dir, advisor_cfg: dict, inc: dict, branches: int, horizon: int, n_seeds: int = 100,
+                      windows: int = 600) -> dict | None:
+    """Rough wall time of the oracle arm from a tuning run: windows in mode (the chosen config's mode share per
+    episode) x candidates (upper bound: greedy + m samples + every named intervention) x branches x
+    (horizon + k - 1) simulated windows, at R6's simulated seconds per window in that run. None without the
+    tuning results."""
+    from pis.adapters import initial_policy
+    from pis.probe import named_interventions
+    from pis.shards import collect
+    d = _abs(tune_dir)
+    eps = [e for x in collect(d) if (x / "episodes.json").is_file()
+           for e in json.loads((x / "episodes.json").read_text())]
+    chosen = advisor_cfg.get("chosen")
+    adv = [e for e in eps if e.get("arm") == chosen]
+    ref = [e for e in eps if e.get("arm") == REFERENCE and e.get("windows")]
+    if not adv or not ref:
+        return None
+    share = np.array([float(e["mode_share"]) for e in adv])
+    sec_per_window = float(np.mean([e["seconds"] / e["windows"] for e in ref]))
+    cands = 1 + int(advisor_cfg["params"]["m"]) + len(named_interventions(initial_policy()))
+    per_decision = cands * int(branches) * (int(horizon) + int(inc["k"]) - 1)
+    per_episode_s = share * windows * per_decision * sec_per_window
+    total_h = n_seeds * float(per_episode_s.mean()) / 3600
+    shards = math.ceil(n_seeds / SHARD_SIZE)
+    return {"episodes": len(adv), "mode_share_mean": float(share.mean()), "mode_share_max": float(share.max()),
+            "candidates_max": cands, "sim_windows_per_decision": per_decision,
+            "sim_s_per_window": sec_per_window, "one_proc_h": total_h,
+            "four_procs_h": total_h * math.ceil(shards / 4) / shards}
 
 
 def validate_protocol(p: dict) -> list[str]:
@@ -312,6 +395,14 @@ def validate_protocol(p: dict) -> list[str]:
         errors.append(f"protocol arms {list(p['arms'])} differ from {list(want)}")
     if p["reference_arm"] != REFERENCE:
         errors.append("the reference arm must be r6")
+    if p["variant"] == "full":
+        o = p.get("oracle") or {}
+        if not (isinstance(o.get("branches"), int) and o["branches"] >= 1 and isinstance(o.get("horizon"), int)
+                and o["horizon"] >= 1):
+            errors.append("the full protocol needs oracle branches and horizon >= 1")
+    q1 = p["success_rule"].get("question_1") or {}
+    if q1.get("primary") not in (q1.get("ml") or []):
+        errors.append("question 1 needs one primary learned predictor")
     if protocol_seeds(p) != list(seed_ranges.HELD_OUT):
         errors.append("the protocol's seeds are not the held-out range 3000-3099")
     if p["duration_s"] != DURATION_S:
@@ -506,21 +597,26 @@ def timing_for(path, advisor_cfg: dict, alarms: dict, wm_sha: str, official: boo
 def calibration_inputs(shadow_cfg: dict, names) -> tuple[dict, dict, dict]:
     """Risk series of the shadow run's calibration episodes (its raw shards) and their incident labels and
     degradation flags (from the store it read): (risks {episode: {name: array}}, labels, active)."""
+    return shadow_inputs(shadow_cfg, names, [int(e) for e in shadow_cfg["calibration"]])
+
+
+def shadow_inputs(shadow_cfg: dict, names, episodes, root: Path = ROOT) -> tuple[dict, dict, dict]:
+    """`calibration_inputs` for any of the shadow run's episodes."""
     import pandas as pd
     from pis.phase_b import incidents
     from pis.phase_b.history import Store
     from pis.shards import collect
-    shadow_dir = _abs(shadow_cfg["_dir"])
-    cal = [int(e) for e in shadow_cfg["calibration"]]
+    shadow_dir = _abs(shadow_cfg["_dir"], root)
+    cal = [int(e) for e in episodes]
     raw = pd.concat([pd.read_parquet(d / "risks.parquet") for d in collect(shadow_dir)], ignore_index=True)
     raw = raw[raw.episode.isin(cal)]
     risks = {int(e): {n: g.sort_values("window")[n].to_numpy(float) for n in names} for e, g in raw.groupby("episode")}
     missing = sorted(set(cal) - set(risks))
     if missing:
-        raise ValueError(f"the shadow run has no risks for calibration episodes {missing[:5]}")
+        raise ValueError(f"the shadow run has no risks for episodes {missing[:5]}")
     rule = shadow_cfg["rule"]
     rule_ = incidents.IncidentRule(int(rule["k"]), int(rule["interval"]), float(rule["majority"]))
-    st = Store(_abs(shadow_cfg["store"]))
+    st = Store(_abs(shadow_cfg["store"], root))
     eps = st.episodes().set_index("seed")
     labels, active = {}, {}
     for e in cal:
@@ -588,7 +684,7 @@ def run_shard(shard, shard_dir: Path, params: dict) -> None:
         adv_params = AdvisorParams(**params["advisor_params"])
     names = params["names"]
     preds = shadow.load_predictors(params["fitted"] if any(n != "world_model" for n in names) else None, names,
-                                   rule, params["world_model"], params["wm_n"])
+                                   rule, params["world_model"], params["wm_n"]) if REFERENCE in arms else {}
     out, rows_all, risk_frames = [], [], []
     for seed in (int(s) for s in shard.items):
         sc = tune.scenario(seed, dur)
@@ -596,7 +692,9 @@ def run_shard(shard, shard_dir: Path, params: dict) -> None:
             t0 = time.perf_counter()
             try:
                 if arm in SELECTION_OF:
-                    ctl = tune.make_advisor(stack, sc.spec, seed, alarms, inc, adv_params, SELECTION_OF[arm], dur)
+                    ctl = tune.make_advisor(stack, sc.spec, seed, alarms, inc, adv_params, SELECTION_OF[arm], dur,
+                                            oracle_branches=params.get("oracle_branches"),
+                                            oracle_horizon=params.get("oracle_horizon"))
                 else:
                     ctl = policies.make(arm, sc.spec, seed)
                 recs = run_episode(sc, ctl, arm)
@@ -736,9 +834,10 @@ def outcome_brier(risks: dict, labels: dict, active: dict, names, episodes, rule
 
 
 def question_one(risks: dict, labels: dict, active: dict, names, calibration, held_out, rule: dict,
-                 blocking=()) -> dict:
+                 blocking=(), primary: str | None = None) -> dict:
     """The shadow run's scoring with thresholds from the calibration episodes, applied to the held-out ones.
-    `blocking`: failed R6 runs or scorings of the attempt (seed, what, message); any makes Q1 not decidable."""
+    `blocking`: failed R6 runs or scorings of the attempt (seed, what, message); any makes Q1 not decidable.
+    `primary`: the protocol's primary learned predictor, the only one the success verdict is about."""
     shared = set(map(int, calibration)) & set(map(int, held_out))
     if shared:
         raise ValueError(f"held-out and calibration episodes overlap: {sorted(shared)[:5]}")
@@ -750,7 +849,8 @@ def question_one(risks: dict, labels: dict, active: dict, names, calibration, he
                for n, d in q1["diffs"].items()}
     blocking = list(blocking)
     return {"predictors": res, "q1": q1, "verdict": verdict, "decidable": not blocking, "blocking": blocking,
-            "above_zero": sorted(n for n, v in verdict.items() if v),
+            "above_zero": sorted(n for n, v in verdict.items() if v), "primary": primary,
+            "primary_above": None if primary is None or blocking else verdict.get(primary),
             "outcome_brier": outcome_brier(risks, labels, active, names, list(held_out), rule)}
 
 
@@ -787,6 +887,15 @@ def report_text(protocol: dict, meta: dict, q2: dict, q1: dict, timing: dict | N
                      f"{_ci(a['value_diff'])} | {_ci(a['slo_diff'])} | {a['incidents_arm']} / {a['incidents_r6']} | "
                      f"{_f(a['mode_share'])} | {_f(a['fallback_share'])} | {a['risk_nan']} | "
                      f"{_f(a['decide_ms_p95'], '{:.1f}')} / {_f(a['decide_ms_max'], '{:.1f}')} |")
+        orc = q2.get("oracle")
+        if orc:
+            L += ["", f"Diagnostic oracle arm ({ORACLE_ARM}: real-simulator branches, own shards after every "
+                  f"primary arm; never part of the success rule; {orc['status']}):", "",
+                  "| arm | time in incident arm / R6 (s) | time diff | value/s diff | intervention rate | "
+                  "fallback share |", "|---|---|---|---|---|---|"]
+            for arm, a in orc["arms"].items():
+                L.append(f"| {arm} | {_f(a['time_arm'])} / {_f(a['time_r6'])} | {_ci(a['time_diff'])} | "
+                         f"{_ci(a['value_diff'])} | {_f(a['mode_share'])} | {_f(a['fallback_share'])} |")
         L += ["", "Chronic episodes (excluded above, reported separately): time in incident diff (arm - R6).", "",
               "| arm | time diff |", "|---|---|"]
         L += [f"| {arm} | {_ci(a['time_diff_chronic'])} |" for arm, a in q2["arms"].items()]
@@ -836,22 +945,27 @@ def report_text(protocol: dict, meta: dict, q2: dict, q1: dict, timing: dict | N
                  + f" ({'/'.join(str(br[c]['n']) for c in ('all',) + CAUSES)}) |")
     L += ["", f"Better non-learned predictor (held-out building-up recall): {q1['q1'].get('non_ml') or '-'}. "
           "Recall difference, 95 % bootstrap interval over episodes (2000 resamples, shared stream):", "",
-          "| predictor | building-up | sudden | above zero |", "|---|---|---|---|"]
+          "| predictor | role | building-up | sudden | above zero |", "|---|---|---|---|---|"]
+    primary = q1.get("primary")
     for n, d in q1["q1"].get("diffs", {}).items():
         cells = [f"{_f(d[c]['diff'], '{:+.2f}')} [{_f(d[c]['lo'], '{:+.2f}')}, {_f(d[c]['hi'], '{:+.2f}')}]"
                  for c in CAUSES]
         v = q1["verdict"].get(n)
-        L.append(f"| {n} | {cells[0]} | {cells[1]} | {'-' if v is None else 'yes' if v else 'no'} |")
-    L.append("")
+        role = "primary" if n == primary else "secondary (no success claim)"
+        L.append(f"| {n} | {role} | {cells[0]} | {cells[1]} | {'-' if v is None else 'yes' if v else 'no'} |")
+    L += ["", f"The protocol fixed one primary learned predictor before the run ({primary or '-'}: best building-up "
+          "recall on the shadow run's selection episodes); the success rule is judged on it alone. The other "
+          "learned predictors are secondary and reported without a success claim.", ""]
     if not q1.get("decidable", True):
         L += [f"{len(q1['blocking'])} R6 run(s) or their predictor scoring failed in this attempt; those episodes "
               "are excluded above and by the protocol the verdict is not decidable.", "",
               "**Question 1: not decidable**"]
-    elif q1.get("above_zero"):
-        L.append(f"**Question 1: learned predictor(s) above the better non-learned one: "
-                 f"{', '.join(q1['above_zero'])}**")
+    elif primary is None:
+        L.append("**Question 1: no primary predictor in the protocol: not decidable**")
+    elif q1.get("primary_above"):
+        L.append(f"**Question 1: SUCCESS ({primary} above the better non-learned predictor)**")
     else:
-        L.append("**Question 1: no learned predictor above the better non-learned one**")
+        L.append(f"**Question 1: not met ({primary} not above the better non-learned predictor)**")
     scoring = q2.get("scoring_failed", [])
     if scoring:
         L += ["", "### Failed predictor scoring (R6 run kept, episode excluded from question 1)", ""]
@@ -898,12 +1012,24 @@ def _write_protocol(a) -> None:
     if target.resolve() == _abs(PROTOCOL).resolve() and overrides:
         raise SystemExit("refusing to write the protocol: the frozen protocol reads the official files")
     try:
-        p = make_protocol(overrides)
+        p = make_protocol(overrides, oracle_branches=a.oracle_branches, oracle_horizon=a.oracle_horizon)
     except (OSError, ValueError) as e:
         raise SystemExit(scrub(f"refusing to write the protocol: {e}"))
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(p, indent=1, allow_nan=False) + "\n")
-    print(f"wrote {safe_path(a.protocol)} ({p['variant']})")
+    print(f"wrote {safe_path(a.protocol)} ({p['variant']}; question 1 primary predictor "
+          f"{p['success_rule']['question_1']['primary']})")
+    if p["oracle"]:
+        proj = oracle_projection(a.tune_dir, load_json(p["files"]["advisor"]["path"]),
+                                 load_json(p["files"]["incident"]["path"]), p["oracle"]["branches"],
+                                 p["oracle"]["horizon"], len(protocol_seeds(p)), int(p["duration_s"] / 0.5))
+        if proj is None:
+            print(f"oracle projection unavailable: no tuning episodes of the chosen config in {safe_path(a.tune_dir)}")
+        else:
+            print(f"oracle arm projection ({p['oracle']['branches']} branches x {p['oracle']['horizon']} windows): "
+                  f"mode share mean {proj['mode_share_mean']:.3f} (max {proj['mode_share_max']:.3f}) over "
+                  f"{proj['episodes']} tuning episodes, <= {proj['sim_windows_per_decision']} simulated windows per "
+                  f"decision -> about {proj['one_proc_h']:.1f} h on one process, {proj['four_procs_h']:.1f} h with 4")
 
 
 def main(argv=None):
@@ -912,6 +1038,10 @@ def main(argv=None):
     ap.add_argument("--write-protocol", action="store_true", help="write the protocol file once and stop")
     for k in PATH_ARGS:
         ap.add_argument(f"--{k.replace('_', '-')}", default=None, help="--write-protocol only (rehearsals)")
+    ap.add_argument("--oracle-branches", type=int, default=ORACLE_BRANCHES, help="--write-protocol only")
+    ap.add_argument("--oracle-horizon", type=int, default=None, help="--write-protocol only (default: h)")
+    ap.add_argument("--tune-dir", default=DEFAULT_TUNE_DIR, help="--write-protocol only: tuning raw results "
+                                                                  "for the oracle projection")
     ap.add_argument("--seeds", default=None, help="default: the protocol's seeds")
     ap.add_argument("--duration", type=float, default=None, help="default: the protocol's episode length")
     ap.add_argument("--attempt", type=int, default=1)
@@ -1052,31 +1182,53 @@ def main(argv=None):
         (raw_attempt / "run_config.json").write_text(scrub(json.dumps(config, indent=1)) + "\n")
 
     from pis.shards import collect, make_shards, run_shards
-    shard_cfg = {**pinned, "seeds": seeds, "duration_s": duration, "arms": arms, "label": a.label,
-                 "shard_size": SHARD_SIZE, "names": names}
-    params = {"incident": inc, "alarms": alarms, "duration_s": duration, "rule": rule, "arms": arms, "names": names,
+    oracle = protocol.get("oracle") or {}
+    primary_arms = [x for x in arms if x != ORACLE_ARM]
+    oracle_arms = [x for x in arms if x == ORACLE_ARM]
+    params = {"incident": inc, "alarms": alarms, "duration_s": duration, "rule": rule, "names": names,
               "world_model": str(_abs(files["world_model"]["path"])), "fitted": str(_abs(files["fitted"]["path"])),
               "wm_n": int(protocol["predictors"]["wm_n"]),
-              "advisor_params": advisor["params"] if full else None}
+              "advisor_params": advisor["params"] if full else None,
+              "oracle_branches": oracle.get("branches"), "oracle_horizon": oracle.get("horizon")}
     shards = make_shards(seeds, SHARD_SIZE)
-    print(f"{title}: {len(seeds)} seeds x {len(arms)} arms in {len(shards)} shards, {a.procs} processes",
-          flush=True)
-    t0 = time.time()
-    res = run_shards(raw_attempt / SHARDS, shards, partial(run_shard, params=params), shard_cfg, a.procs)
-    runtime = time.time() - t0
-    config["runtime_s"] = round(config.get("runtime_s", 0) + runtime)
-    dirs = collect(raw_attempt / SHARDS)
-    print(f"shards done {len(res['done'])}, skipped {len(res['skipped'])}, failed {res['failed']} in "
-          f"{runtime:.0f} s", flush=True)
+
+    def run_set(sub: str, which: list[str]):
+        cfg = {**pinned, "seeds": seeds, "duration_s": duration, "arms": which, "label": a.label,
+               "shard_size": SHARD_SIZE, "names": names, "oracle": oracle if ORACLE_ARM in which else None}
+        t_set = time.time()
+        res = run_shards(raw_attempt / sub, shards, partial(run_shard, params={**params, "arms": which}), cfg, a.procs)
+        config["runtime_s"] = round(config.get("runtime_s", 0) + time.time() - t_set)
+        print(f"{sub}: done {len(res['done'])}, skipped {len(res['skipped'])}, failed {res['failed']} in "
+              f"{time.time() - t_set:.0f} s", flush=True)
+        return collect(raw_attempt / sub)
+
+    print(f"{title}: {len(seeds)} seeds x {len(primary_arms)} primary arms in {len(shards)} shards"
+          + (f", then {ORACLE_ARM} in its own shards" if oracle_arms else "") + f", {a.procs} processes", flush=True)
+    dirs = run_set(SHARDS, primary_arms)
     if len(dirs) != len(shards):
         (raw_attempt / "run_config.json").write_text(scrub(json.dumps(config, indent=1)) + "\n")
         print(f"unfinished shards: commit the report's started section, then rerun with --attempt {a.attempt} "
               "--resume", flush=True)
-        return {"unfinished": res}
+        return {"unfinished": True}
 
     import pandas as pd
     from pis.phase_b import incidents
     episodes = [e for d in dirs for e in json.loads((d / EPISODES_FILE).read_text())]
+    # the primary result is final before the diagnostic oracle arm starts
+    primary_q2 = question_two(episodes, primary_arms, protocol["success_rule"]["question_2"], timing)
+    (raw_attempt / PRIMARY_FILE).write_text(scrub(json.dumps(
+        {"success": primary_q2["success"], "failed": primary_q2["failed"],
+         "utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())}, indent=1, default=str)) + "\n")
+    if primary_q2["success"] is not None:
+        s_ = primary_q2["success"]
+        print("primary question 2: " + ("not decidable" if not s_["decidable"] else "SUCCESS" if s_["met"]
+                                        else "not met"), flush=True)
+    oracle_status = None
+    if oracle_arms:
+        odirs = run_set(ORACLE_SHARDS, oracle_arms)
+        oracle_status = "complete" if len(odirs) == len(shards) else \
+            f"incomplete: {len(odirs)} of {len(shards)} shards finished"
+        episodes += [e for d in odirs for e in json.loads((d / EPISODES_FILE).read_text())]
     held_risk_files = [d / RISKS_FILE for d in dirs if (d / RISKS_FILE).is_file()]
     risks, labels, active = dict(cal_risks), dict(cal_labels), dict(cal_active)
     rule_ = incidents.IncidentRule(int(rule["k"]), int(rule["interval"]), float(rule["majority"]))
@@ -1094,10 +1246,14 @@ def main(argv=None):
             labels[e] = incidents.label_series(np.array([c == "1" for c in ref[e]["viol"]], bool), active[e], rule_,
                                                int(rule["warmup"]))
             scored.append(e)
-    q2 = question_two(episodes, arms, protocol["success_rule"]["question_2"], timing)
+    q2 = primary_q2
+    if oracle_arms:
+        q2["oracle"] = {**question_two(episodes, [REFERENCE] + oracle_arms, "not attempted", None),
+                        "status": oracle_status}
     blocking = [(s, arm, msg) for s, arm, msg in q2["failed"] if arm == REFERENCE] + \
         [(s, "scoring", msg) for s, msg in q2["scoring_failed"]]
-    q1 = question_one(risks, labels, active, names, calibration, sorted(scored), rule, blocking)
+    q1 = question_one(risks, labels, active, names, calibration, sorted(scored), rule, blocking,
+                      protocol["success_rule"]["question_1"].get("primary"))
     proj = projection(episodes, arms, len(protocol_seeds(protocol)), duration, float(protocol["duration_s"]),
                       a.procs)
     config.update(end_utc=time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
@@ -1112,6 +1268,8 @@ def main(argv=None):
                           f"{proj['procs_h']:.1f} h with {a.procs} process(es), {proj['four_procs_h']:.1f} h with 4; linear in the episode length, so a rough "
                           "estimate from short episodes")
     meta["finished (UTC)"] = config["end_utc"]
+    if oracle_status and oracle_status != "complete":
+        problems.append(f"the diagnostic {ORACLE_ARM} arm is {oracle_status}")
     text = report_text(protocol, meta, q2, q1, timing, problems)
     out.write_text(replace_section(out.read_text(), a.attempt, scrub(text + "\n")))
     print(f"done: {config['runs_ok']} runs ok, {config['runs_failed']} failed -> {safe_path(a.out)}", flush=True)
