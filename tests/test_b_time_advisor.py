@@ -71,3 +71,17 @@ def test_time_advisor_smoke_end_to_end(timing, tmp_path):
                                   "config": str(tmp_path / "advisor.json"), "selection": "model"}, cfg, sha,
                             alarms)
     assert sha in text and "p95" in text and "in intervention mode" in text
+
+
+def test_frozen_inputs_of_a_real_run(timing):
+    inc = {"k": 7, "interval": 28, "majority": 0.5, "warmup": 20, "H": 20, "chronic": 0.5}
+    alarms = {"predictor": "hazard", "threshold": 0.4, "low": 0.28, "H": 20, "alpha": 0.1}
+    cfg = {"alarms": {"predictor": "hazard", "threshold": 0.4, "low": 0.28, "H": 20},
+           "rule": {"k": 7, "interval": 28, "majority": 0.5, "warmup": 20}}
+    a = {"incident": "configs/phase_b/incident.json", "alarms": "configs/phase_b/alarms.json"}
+    assert timing.frozen_problems(a, cfg, inc, alarms) == []
+    assert timing.frozen_problems({**a, "alarms": "data/phase_b/smoke_x/alarms.json"}, cfg, inc, alarms)
+    assert timing.frozen_problems({**a, "incident": "data/phase_b/smoke_x/incident.json"}, cfg, inc, alarms)
+    assert timing.frozen_problems(a, cfg, inc, {**alarms, "threshold": 0.5})
+    assert timing.frozen_problems(a, {**cfg, "alarms": None}, inc, alarms)
+    assert timing.frozen_problems(a, cfg, {**inc, "k": 6}, alarms)

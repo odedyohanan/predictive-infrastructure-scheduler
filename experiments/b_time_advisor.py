@@ -12,8 +12,10 @@ decision time per window (p50 / p95 / max) per seed and pooled, also over the wi
 alone, with the share spent on the alarm risk and on the candidate selection. Verdict against p95 <= 50 ms
 and max <= 500 ms in every episode. Output: results/phase_b/advisor_timing.md with the config and the
 world model's sha256 (never overwritten). Smoke runs (`--label smoke`) may use history seeds, a shorter
-`--duration` and `--selection always` (every window in intervention mode: the worst case), allow a dirty
-tree, and write only into `--smoke-dir`.
+`--duration` and `--selection always` (every window from the warm-up on in intervention mode, the warm-up
+itself never: the worst case), allow a dirty tree, and write only into `--smoke-dir`. A real run reads the
+frozen configs/phase_b/{incident,alarms}.json, and they must match the rule and alarm the advisor config was
+tuned with.
 """
 from __future__ import annotations
 
@@ -81,6 +83,24 @@ def check_run(a: dict, dirty: bool, note_exists: bool) -> list[str]:
         if note_exists:
             errors.append("the timing note already exists (never overwritten)")
     return errors
+
+
+FROZEN = {"incident": "configs/phase_b/incident.json", "alarms": "configs/phase_b/alarms.json"}
+ALARM_KEYS = ("predictor", "threshold", "low", "H")
+RULE_KEYS = ("k", "interval", "majority", "warmup")
+
+
+def frozen_problems(a: dict, cfg: dict, inc: dict, alarms: dict) -> list[str]:
+    """Why a real run's incident and alarms configs are not the frozen ones the advisor was tuned with."""
+    out = []
+    for key, frozen in FROZEN.items():
+        if Path(a[key]).resolve() != (ROOT / frozen).resolve():
+            out.append(f"a real run reads the frozen {frozen} (--{key})")
+    if cfg.get("alarms") != {k: alarms.get(k) for k in ALARM_KEYS}:
+        out.append("the alarms config differs from the one in the advisor config")
+    if cfg.get("rule") != {k: inc.get(k) for k in RULE_KEYS}:
+        out.append("the incident rule differs from the one in the advisor config")
+    return out
 
 
 def measure(seeds, duration_s: float, cfg: dict, inc: dict, alarms: dict, world_model, fitted,
@@ -185,6 +205,10 @@ def main(argv=None) -> dict:
     cfg, inc, alarms = (runs.read_json(Path(p)) for p in (a.config, a.incident, a.alarms))
     if not cfg.get("params"):
         raise SystemExit("refusing to run: the advisor config has no chosen params")
+    if not smoke:
+        errors = frozen_problems(vars(a), cfg, inc, alarms)
+        if errors:
+            raise SystemExit("refusing to run: " + "; ".join(errors))
     from pis.phase_b.wm_prob import sha256
     if not Path(a.world_model).exists():
         raise SystemExit("refusing to run: no world-model checkpoint")

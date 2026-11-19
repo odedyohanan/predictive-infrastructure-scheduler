@@ -10,7 +10,8 @@ paired per seed; the config with the least time in incident that keeps the value
 Every seed runs R6 (the reference) and the advisor with eps in EPS_GRID x n in N_GRID (m = 4, h = min(H, 20))
 on the same scenario. The alarm predictor, its threshold and `low` come from the alarms config; the predictor
 is loaded as the shadow run used it (its fitted pickle, or the world model with the shadow run's number of
-futures); the advisor's futures come from `--world-model`. Reward weights (slo_lam, mu, change cost) are the
+futures; a real run refuses a world model other than the shadow run's); the advisor's futures come from
+`--world-model`. Reward weights (slo_lam, mu, change cost) are the
 Step A loop's (configs/step_a.json).
 
 Per episode: time in incident (s), counted incidents, value per second, share of windows in intervention
@@ -115,6 +116,25 @@ def scenario(seed: int, duration_s: float):
     from pis.phase_b.scenarios import scenario_for
     sc = scenario_for(seed)
     return sc if duration_s == sc.duration_s else dataclasses.replace(sc, duration_s=duration_s)
+
+
+def shadow_wm_n(fitted, world_model_sha: str | None, wm_n: int | None, smoke: bool) -> int:
+    """Number of world-model futures of the alarm predictor: the shadow run's (its config.json next to the
+    fitted predictors). A real run refuses a missing shadow config, a world model other than the shadow run's
+    and a --wm-n other than its; a smoke run takes --wm-n, else the shadow config's, else 32."""
+    path = Path(fitted).parent / "config.json" if fitted else None
+    shadow_cfg = runs.read_json(path) if path is not None else {}
+    if smoke:
+        return int(wm_n) if wm_n is not None else int(shadow_cfg.get("wm_n", 32))
+    if not shadow_cfg:
+        raise ValueError("a real run needs the shadow run's config.json next to --fitted")
+    if shadow_cfg.get("world_model_sha256") != world_model_sha:
+        raise ValueError("the world model differs from the one the shadow run scored")
+    if "wm_n" not in shadow_cfg:
+        raise ValueError("the shadow run's config.json lacks wm_n")
+    if wm_n is not None and int(wm_n) != int(shadow_cfg["wm_n"]):
+        raise ValueError(f"--wm-n {wm_n} differs from the shadow run's wm_n {shadow_cfg['wm_n']}")
+    return int(shadow_cfg["wm_n"])
 
 
 # ------------------------------------------------------------------ metrics
@@ -355,10 +375,12 @@ def main(argv=None) -> dict:
     if not smoke and (alarms.get("predictor") is None or alarms.get("threshold") is None):
         raise SystemExit("refusing to run: the alarms config has no predictor with a threshold")
     step_a = json.loads((ROOT / STEP_A).read_text())["params"]
-    wm_n = a.wm_n
-    if wm_n is None:
-        shadow_cfg = runs.read_json(Path(a.fitted).parent / "config.json") if a.fitted else {}
-        wm_n = int(shadow_cfg.get("wm_n", 32))
+    from pis.phase_b.wm_prob import sha256
+    wm_sha = sha256(a.world_model) if a.world_model and Path(a.world_model).exists() else None
+    try:
+        wm_n = shadow_wm_n(a.fitted, wm_sha, a.wm_n, smoke)
+    except ValueError as e:
+        raise SystemExit(f"refusing to run: {e}")
     out = (sdir / "advisor_tune") if smoke else ROOT / DEFAULT_OUT
     note = (sdir / "advisor_dev.md") if smoke else ROOT / NOTE
     config = (sdir / "advisor.json") if smoke else ROOT / CONFIG

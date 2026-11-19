@@ -293,3 +293,25 @@ def test_advisor_history_and_candidates_use_the_masked_policy():
     for a, b in zip(sent, want):
         np.testing.assert_array_equal(a, b)
     assert any(not np.array_equal(encode_policy(c), w) for c, w in zip(ctl.last["candidates"], want))
+
+
+# ------------------------------------------------------------------ hardening
+def test_non_finite_risk_keeps_the_previous_mode_and_is_counted():
+    sc = _scenario(4.0)
+    nan = float("nan")
+    risks = [0, 0, 0.9, nan, nan, 0.1, nan, 0.1]
+    recs = run_episode(sc, _ctrl(sc, risks), "advisor")
+    assert [r["info"]["mode"] for r in recs] == [False, False, True, True, True, False, False, False]
+    assert [r["info"]["risk_nan"] for r in recs] == [False, False, False, True, True, False, True, False]
+    assert all(r["info"]["risk"] is None for r in recs if r["info"]["risk_nan"])
+
+
+def test_only_the_oracle_keeps_the_simulator():
+    sc = _scenario(2.0)
+    for selection in ("model", "random", "always"):
+        ctl = _ctrl(sc, [0.9], selection=selection)
+        run_episode(sc, ctl, "advisor")
+        assert ctl.sim is None and ctl.dsim is None
+    ctl = _ctrl(sc, [0.9], selection="oracle", params=_params(h=2), oracle_branches=1)
+    run_episode(sc, ctl, "advisor")
+    assert ctl.sim is not None and ctl.dsim is not None

@@ -112,3 +112,22 @@ def test_tune_end_to_end_and_resume(tune, tmp_path):
     assert again["shards"]["skipped"] and not again["shards"]["done"]
     with pytest.raises(ValueError):
         tune.tune(**{**args, "duration_s": 12.0})                         # changed configuration refused
+
+
+def test_shadow_wm_n_real_runs_need_the_shadow_config(tune, tmp_path):
+    fitted = tmp_path / "shadow" / "predictors.pkl"
+    fitted.parent.mkdir()
+    fitted.write_bytes(b"x")
+    with pytest.raises(ValueError, match="config.json"):
+        tune.shadow_wm_n(fitted, "abc", None, smoke=False)              # no shadow config
+    (fitted.parent / "config.json").write_text(json.dumps({"wm_n": 16, "world_model_sha256": "abc"}))
+    assert tune.shadow_wm_n(fitted, "abc", None, smoke=False) == 16
+    with pytest.raises(ValueError, match="world model"):
+        tune.shadow_wm_n(fitted, "def", None, smoke=False)              # another world model
+    with pytest.raises(ValueError, match="wm"):
+        tune.shadow_wm_n(fitted, "abc", 32, smoke=False)                # another number of futures
+    (fitted.parent / "config.json").write_text(json.dumps({"world_model_sha256": "abc"}))
+    with pytest.raises(ValueError, match="wm_n"):
+        tune.shadow_wm_n(fitted, "abc", None, smoke=False)              # no silent default
+    assert tune.shadow_wm_n(fitted, "def", None, smoke=True) == 32      # smoke: stand-ins allowed
+    assert tune.shadow_wm_n(fitted, "def", 8, smoke=True) == 8

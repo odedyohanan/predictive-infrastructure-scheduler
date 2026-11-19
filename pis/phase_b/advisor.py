@@ -6,7 +6,8 @@ force, masked for the dead CPUs and GPUs the telemetry's "hardware" block report
 and the store records it), to its own history, builds predictor rows from it (`features.rows_from_records`) and asks the
 predictor for the risk of a new incident within H (from the warm-up on; before it there is no risk). The
 intervention mode turns on when the risk reaches the alarm threshold and stays on until the risk falls
-below `low` (the alarm's hysteresis). Outside the mode the advisor returns R6's greedy decision unchanged.
+below `low` (the alarm's hysteresis). A non-finite risk after the warm-up keeps the mode as it was (flagged
+`risk_nan`). Outside the mode the advisor returns R6's greedy decision unchanged.
 
 In the mode the candidates are R6's greedy decision, `m` R6 samples and the "after" policies of the named
 interventions that differ from the policy in force, de-duplicated (first occurrence kept, greedy first).
@@ -19,15 +20,15 @@ Choice: among candidates with probability <= eps the highest mean value; values 
 the higher CVaR (10 %) of the per-future total reward wins; then the lower index. No feasible candidate, or
 a current state outside the model's training range: R6's greedy decision, flagged as a fallback.
 
-Per window `info` holds decide_ms (risk_ms + select_ms and bookkeeping), risk (None before the warm-up),
-mode, chosen (candidate index; -1 on a fallback; None outside the mode), fallback, reason, chosen_kind,
+Per window `info` holds decide_ms (risk_ms + select_ms and bookkeeping), risk (None before the warm-up
+and when not finite), risk_nan (a non-finite risk after the warm-up), mode, chosen (candidate index; -1 on a fallback; None outside the mode), fallback, reason, chosen_kind,
 pred_incident_p (the chosen candidate's predicted probability, R6 greedy's on a fallback; None outside the
 mode, for random selection and when the model was not consulted) and n_candidates.
 
 Selection arms on the same candidates: "model" (the above), "random" (uniform choice in the mode),
 "oracle" (the real degraded simulator, branched `oracle_branches` times per candidate, true values and
-true onset shares, same rule; needs `attach_dsim`), "always" (the mode on in every window from the
-warm-up, without the alarm).
+true onset shares, same rule; needs `attach_dsim`; only this selection keeps the simulator), "always"
+(the mode on in every window from the warm-up on, never before it, without the alarm).
 """
 from __future__ import annotations
 
@@ -53,7 +54,7 @@ from worldmodel.features import encode_policy, encode_state  # noqa: E402
 
 BASE_CKPT = "models/rl_r6/final.pt"
 SELECTIONS = ("model", "random", "oracle", "always")
-INFO_KEYS = ("decide_ms", "risk", "mode", "chosen", "fallback", "pred_incident_p", "n_candidates")
+INFO_KEYS = ("decide_ms", "risk", "risk_nan", "mode", "chosen", "fallback", "pred_incident_p", "n_candidates")
 ROLL_TAG = 18_000_000       # model futures at window t of episode s: ROLL_TAG + s*1000 + t
 RANDOM_TAG = 15_000         # random selection of episode s: RANDOM_TAG + s
 ORACLE_TAG = 16_000_000     # oracle branch j at any window of episode s: ORACLE_TAG + s*1000 + j
@@ -215,24 +216,32 @@ class AdvisorController:
         self.last: dict = {}
 
     def attach_sim(self, sim) -> None:
-        self.sim = sim
+        if self.selection == "oracle":
+            self.sim = sim
 
     def attach_dsim(self, dsim) -> None:
-        """The degraded simulator of the running episode (read through reseeded clones only)."""
-        self.dsim = dsim
+        """The degraded simulator of the running episode (read through reseeded clones only); kept by the
+        oracle selection alone, so no other arm can read the real system."""
+        if self.selection == "oracle":
+            self.dsim = dsim
 
     # ------------------------------------------------------------------ risk and mode
-    def _risk(self) -> float | None:
+    def _risk(self) -> tuple[float | None, bool]:
+        """(risk, non-finite flag); (None, False) in the warm-up, (None, True) for a non-finite risk."""
         t = self.rows.n - 1
         if t < self.warmup:
-            return None
+            return None, False
         r = float(self.predictor.risk(self.rows.frame(), self.H, episode=self.seed))
-        return r if math.isfinite(r) else None
+        return (r, False) if math.isfinite(r) else (None, True)
 
-    def _update_mode(self, risk: float | None) -> bool:
+    def _update_mode(self, risk: float | None, nan: bool = False) -> bool:
         if self.selection == "always":
             return self.rows.n - 1 >= self.warmup
-        if risk is None or self.threshold is None:
+        if self.threshold is None:
+            return False
+        if nan:
+            return self.mode
+        if risk is None:
             return False
         if not self.mode:
             return risk >= self.threshold
@@ -318,10 +327,10 @@ class AdvisorController:
         t0 = time.perf_counter()
         self.dead = dead_hardware(tel)
         self.rows.append(tel, mask_policy(current, *self.dead))
-        risk = self._risk()
+        risk, nan = self._risk()
         t_risk = time.perf_counter()
-        self.mode = self._update_mode(risk)
-        info = {"risk": risk, "mode": self.mode, "chosen": None, "fallback": False, "pred_incident_p": None,
+        self.mode = self._update_mode(risk, nan)
+        info = {"risk": risk, "risk_nan": nan, "mode": self.mode, "chosen": None, "fallback": False, "pred_incident_p": None,
                 "n_candidates": 0, "reason": "no_alarm", "chosen_kind": "greedy", "selection": self.selection}
         if not self.mode:
             greedy, _ = self.base.propose(tel, current, 0, self.rng)
