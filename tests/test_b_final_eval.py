@@ -485,3 +485,56 @@ def test_value_bound_uses_the_absolute_r6_mean(fe, tmp_path):
     eps = [dict(e, value_per_s=-e["value_per_s"]) for e in _episodes()]
     s = fe.question_two(eps, ["r6", "advisor"], rule, TIMING_OK)["success"]
     assert s["value_bound"] < 0
+
+
+# ------------------------------------------------------------------ live rows vs store rows
+def test_live_rows_keep_the_exact_known_values():
+    from sched.randomize import known_params
+    from pis.phase_b import features
+    from pis.phase_b.episode import run_episode
+    from pis.phase_b.scenarios import scenario_for
+    from pis.harness import BaseGreedyController
+    sc = scenario_for(3450)
+    import dataclasses
+    sc = dataclasses.replace(sc, duration_s=2.0)
+    known = known_params(sc.spec)
+    rows = features.rows_from_records(run_episode(sc, BaseGreedyController(sc.spec), "r6"), known, episode=3450)
+    for name, col in zip(features.KNOWN_NAMES, features.KNOWN_COLS):
+        assert rows[col].dtype == np.float64 and (rows[col] == float(known[name])).all()
+
+
+PROBE_STORE, PROBE_SHADOW = "data/phase_b/timing_probe", "data/phase_b/smoke_g5/shadow"
+PROBE_WM, PROBE_SEED, PROBE_WINDOWS = "models/smoke_g4/pgru_smoke.pt", 3104, 160
+
+
+def _probe_paths():
+    from tests._load import ROOT
+    return ROOT / PROBE_STORE, ROOT / PROBE_SHADOW, ROOT / PROBE_WM
+
+
+@pytest.mark.skipif(not all(p.exists() for p in _probe_paths()), reason="probe store and smoke models not present")
+def test_live_rows_give_the_store_risks():
+    """An R6 probe episode rerun live: every predictor's risk series from `rows_from_records` equals the one
+    from the store rows the shadow run reads (world model with its fixed per-episode seed)."""
+    from sched.randomize import known_params
+    from pis.phase_b import features, policies, runs
+    from pis.phase_b.episode import run_episode
+    from pis.phase_b.history import Store
+    from pis.phase_b.scenarios import scenario_for
+    store, shadow_dir, wm = _probe_paths()
+    shadow = runs.load_script("b_shadow")
+    st = Store(store)
+    eps = st.episodes()
+    assert eps.set_index("seed").loc[PROBE_SEED, "source"] == "r6"
+    stored = features.join_known(st.window_rows(PROBE_SEED, 0, 600), eps)
+    sc = scenario_for(PROBE_SEED)
+    live = features.rows_from_records(run_episode(sc, policies.make("r6", sc.spec, PROBE_SEED), "r6"),
+                                      known_params(sc.spec), episode=PROBE_SEED)
+    cfg = json.loads((shadow_dir / "config.json").read_text())
+    names, rule = cfg["names"], cfg["rule"]
+    assert set(names) == {"world_model", "hazard", "analogue", "queueing", "change_point"}
+    preds = [shadow.load_predictors(shadow_dir / "predictors.pkl", names, rule, wm, 8) for _ in range(2)]
+    a = shadow.episode_risks(preds[0], names, stored.iloc[:PROBE_WINDOWS], rule["H"], rule["warmup"], PROBE_SEED)
+    b = shadow.episode_risks(preds[1], names, live.iloc[:PROBE_WINDOWS], rule["H"], rule["warmup"], PROBE_SEED)
+    for n in names:
+        np.testing.assert_allclose(b[n], a[n], rtol=0, atol=1e-9, err_msg=n)

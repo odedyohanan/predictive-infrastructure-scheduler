@@ -110,8 +110,10 @@ def rows_from_records(records: list[dict], known, slo_ms: float = incidents.SLO_
         cols[c] = w.policies[:, i]
     cols["slo_v2_violation"] = incidents.violations(records, slo_ms)
     cols["deg_active"] = np.array([bool(r["tel"].get("phase_b", {}).get("active", False)) for r in records])
-    for c, v in zip(KNOWN_COLS, w.known):
-        cols[c] = np.full(len(records), float(v))
+    # the exact known values, as the store writes them (the model input rounds them to float32 separately)
+    exact = [float(known[n]) for n in KNOWN_NAMES] if isinstance(known, dict) else [float(v) for v in w.known]
+    for c, v in zip(KNOWN_COLS, exact):
+        cols[c] = np.full(len(records), v)
     return pd.DataFrame(cols)
 
 
