@@ -1,7 +1,9 @@
 {
+  "H": 20,
   "chronic": 0.5,
   "interval": 76,
   "k": 19,
   "majority": 0.5,
+  "min_lead_windows": 1,
   "warmup": 20
 }
