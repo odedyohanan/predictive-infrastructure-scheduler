@@ -4,5 +4,7 @@
   "low": 0.26599999999999996,
   "min_lead_windows": 1,
   "predictor": "analogue",
-  "threshold": 0.38
+  "shadow_dir": "results/raw/phase_b/shadow_rssm_b2",
+  "threshold": 0.38,
+  "world_model": "models/rssm_b2.pt"
 }
