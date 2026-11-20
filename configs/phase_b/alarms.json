@@ -1,0 +1,10 @@
+{
+  "H": 20,
+  "alpha": 0.1,
+  "low": 0.26599999999999996,
+  "min_lead_windows": 1,
+  "predictor": "analogue",
+  "shadow_dir": "results/raw/phase_b/shadow_tf_b3",
+  "threshold": 0.38,
+  "world_model": "models/tf_b3.pt"
+}

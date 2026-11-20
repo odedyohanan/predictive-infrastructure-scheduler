@@ -411,7 +411,9 @@ def test_attempts_are_pinned_to_the_previous_configuration():
     assert fe.pinned_mismatch(None, prev)
 
 
-def test_official_timing_checked_before_start(tmp_path):
+def test_official_timing_checked_before_start(tmp_path, monkeypatch):
+    monkeypatch.setattr(fe, "TIMING_NOTES", {"loop_a": str(tmp_path / "a" / "timing.md"),
+                                             "loop_b": str(tmp_path / "b" / "timing.md")})
     steps = {"step_a": {"members": ["m"], "params": {}}, "step_b": {"members": ["m"], "reviser": {}}}
     bad = fe.timing_refusals(steps, {"m": "a" * 64}, lambda path: False)
     assert len(bad) == 2 and all("unavailable" in b or "missing" in b for b in bad)
