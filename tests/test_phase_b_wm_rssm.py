@@ -193,7 +193,7 @@ def test_loader_reads_a_legacy_checkpoint_without_kind(tmp_path):
     np.testing.assert_array_equal(m.sample_rollouts(w, w.policies[-1], None, 4, 3, seed=1),
                                   g.sample_rollouts(w, w.policies[-1], None, 4, 3, seed=1))
     with pytest.raises(ValueError, match="unknown"):
-        torch.save({"kind": "transformer"}, tmp_path / "x.pt")
+        torch.save({"kind": "lstm"}, tmp_path / "x.pt")
         world_models.load_world_model(tmp_path / "x.pt")
 
 

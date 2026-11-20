@@ -1,9 +1,10 @@
 """The sampled world models by kind: loading a checkpoint whatever its kind, and the trainer of each kind.
 
-A checkpoint records its kind ("pgru": `wm_prob.ProbWorldModel`, "rssm": `wm_rssm.RSSMWorldModel`);
-checkpoints written before kinds were recorded are probabilistic GRUs. Every kind offers the same interface
-(`context`, `room`, `bounds`, `meta`, `predict`, `sample_rollouts`, `sample_rollouts_batch`, `save`), so
-predictors, calibration and the advisor take any of them.
+A checkpoint records its kind ("pgru": `wm_prob.ProbWorldModel`, "rssm": `wm_rssm.RSSMWorldModel`,
+"transformer": `wm_transformer.TransformerWorldModel`); checkpoints written before kinds were recorded are
+probabilistic GRUs. Every kind offers the same interface (`context`, `room`, `bounds`, `meta`, `predict`,
+`sample_rollouts`, `sample_rollouts_batch`, `save`), so predictors, calibration and the advisor take any of
+them.
 """
 from __future__ import annotations
 
@@ -11,8 +12,9 @@ import importlib
 
 import torch
 
-ARCHS = ("pgru", "rssm")
-_CLASSES = {"pgru": ("pis.phase_b.wm_prob", "ProbWorldModel"), "rssm": ("pis.phase_b.wm_rssm", "RSSMWorldModel")}
+ARCHS = ("pgru", "rssm", "transformer")
+_CLASSES = {"pgru": ("pis.phase_b.wm_prob", "ProbWorldModel"), "rssm": ("pis.phase_b.wm_rssm", "RSSMWorldModel"),
+            "transformer": ("pis.phase_b.wm_transformer", "TransformerWorldModel")}
 
 
 def _module(arch: str):
