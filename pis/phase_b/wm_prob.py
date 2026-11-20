@@ -80,10 +80,14 @@ def gaussian_nll(mean, logvar, y, mask) -> torch.Tensor:
 
 
 # ------------------------------------------------------------------ the model
-class ProbWorldModel:
-    """Network + normalisers + meta (context, training bounds, recipe; sha256 once saved or loaded)."""
+class WorldModelBase:
+    """Network + normalisers + meta (context, training bounds, recipe; sha256 once saved or loaded), and what
+    every sampled world model shares: policy handling, batched candidates, checkpoint files. A subclass sets
+    `KIND` (recorded in the checkpoint), `NET` (the network class) and implements `_sample`."""
+    KIND = ""
+    NET = None
 
-    def __init__(self, net: ProbGRU, x_norm: Normalizer, y_norm: Normalizer, meta: dict | None = None):
+    def __init__(self, net, x_norm: Normalizer, y_norm: Normalizer, meta: dict | None = None):
         self.net, self.x_norm, self.y_norm, self.meta = net, x_norm, y_norm, dict(meta or {})
         self.net.eval()
 
@@ -100,24 +104,6 @@ class ProbWorldModel:
         if "state_min" not in self.meta:
             return None
         return (np.asarray(self.meta["state_min"], np.float32), np.asarray(self.meta["state_max"], np.float32))
-
-    @torch.inference_mode()
-    def _run(self, xs: np.ndarray, h=None):
-        """Standardised inputs [N, L, in] (and a recurrent state) -> mean, log-variance at the last
-        position, new recurrent state."""
-        mean, logvar, h = self.net(torch.from_numpy(xs), h)
-        return mean[:, -1].numpy(), logvar[:, -1].numpy(), h
-
-    def _last(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Standardised mean and log-variance at the last position of raw inputs [N, L, in]."""
-        mean, logvar, _ = self._run(self.x_norm.transform(x))
-        return mean, logvar
-
-    def predict(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Mean and variance of the next change, in encoded units, for input windows [N, L, in]."""
-        mean, logvar = self._last(np.asarray(x, dtype=np.float32))
-        std = self.y_norm.std.astype(np.float64)
-        return (mean * std + self.y_norm.mean), np.exp(logvar) * std ** 2
 
     def _policy_steps(self, policy, horizon: int) -> np.ndarray:
         if isinstance(policy, dict):
@@ -155,6 +141,70 @@ class ProbWorldModel:
 
     def _sample(self, history: features.Window, pols: np.ndarray, known, horizon: int,
                 seed: int | None) -> np.ndarray:
+        raise NotImplementedError
+
+    def _clip_bounds(self, n_state: int) -> tuple[np.ndarray, np.ndarray | None]:
+        """Lower (at least 0) and upper (None when unknown) bounds that sampled states are clipped to."""
+        lo, hi = self.bounds if self.bounds is not None else (np.zeros(n_state, np.float32), None)
+        return np.maximum(lo, 0.0), hi
+
+    def save(self, path) -> str:
+        """Write the checkpoint; returns (and records in `meta`) its sha256."""
+        path = Path(path)
+        meta = {k: v for k, v in self.meta.items() if k != "sha256"}
+        torch.save({"kind": self.KIND, "state_dict": self.net.state_dict(), "arch": self.net.params(),
+                    "x_norm": (self.x_norm.mean, self.x_norm.std), "y_norm": (self.y_norm.mean, self.y_norm.std),
+                    "meta": meta}, path)
+        self.meta["sha256"] = sha256(path)
+        return self.meta["sha256"]
+
+    @classmethod
+    def from_checkpoint(cls, ck: dict, path) -> "WorldModelBase":
+        """The model of a loaded checkpoint dict `ck` read from `path` (its kind must be this class's)."""
+        kind = checkpoint_kind(ck)
+        if kind != cls.KIND:
+            raise ValueError(f"the checkpoint holds a {kind!r} world model, not {cls.KIND!r}")
+        net = cls.NET(**ck["arch"])
+        net.load_state_dict(ck["state_dict"])
+        m = cls(net, Normalizer(*ck["x_norm"]), Normalizer(*ck["y_norm"]), ck.get("meta") or {})
+        m.meta["sha256"] = sha256(path)
+        return m
+
+    @classmethod
+    def load(cls, path):
+        return cls.from_checkpoint(torch.load(path, weights_only=False), path)
+
+
+def checkpoint_kind(ck: dict) -> str:
+    """The world-model kind a checkpoint records; checkpoints written before kinds existed hold a "pgru"."""
+    return str(ck.get("kind") or "pgru")
+
+
+class ProbWorldModel(WorldModelBase):
+    """The probabilistic GRU: a Gaussian over the next change straight from the recurrent state."""
+    KIND = "pgru"
+    NET = ProbGRU
+
+    @torch.inference_mode()
+    def _run(self, xs: np.ndarray, h=None):
+        """Standardised inputs [N, L, in] (and a recurrent state) -> mean, log-variance at the last
+        position, new recurrent state."""
+        mean, logvar, h = self.net(torch.from_numpy(xs), h)
+        return mean[:, -1].numpy(), logvar[:, -1].numpy(), h
+
+    def _last(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Standardised mean and log-variance at the last position of raw inputs [N, L, in]."""
+        mean, logvar, _ = self._run(self.x_norm.transform(x))
+        return mean, logvar
+
+    def predict(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Mean and variance of the next change, in encoded units, for input windows [N, L, in]."""
+        mean, logvar = self._last(np.asarray(x, dtype=np.float32))
+        std = self.y_norm.std.astype(np.float64)
+        return (mean * std + self.y_norm.mean), np.exp(logvar) * std ** 2
+
+    def _sample(self, history: features.Window, pols: np.ndarray, known, horizon: int,
+                seed: int | None) -> np.ndarray:
         """Ancestral sampling of one future per row of `pols` [R, horizon, 33]."""
         k = features.known_vector(known if known is not None else history.known)
         n = pols.shape[0]
@@ -163,8 +213,7 @@ class ProbWorldModel:
         past = np.concatenate([S[:-1], P[1:], np.broadcast_to(k, (len(S) - 1, len(k)))], axis=1)
         seq = [np.broadcast_to(self.x_norm.transform(past), (n,) + past.shape)] if len(past) else []
         s = np.broadcast_to(S[-1], (n, S.shape[1])).astype(np.float32)
-        lo, hi = self.bounds if self.bounds is not None else (np.zeros(S.shape[1], np.float32), None)
-        lo = np.maximum(lo, 0.0)
+        lo, hi = self._clip_bounds(S.shape[1])
         rng = np.random.default_rng(seed)
         std, mu = self.y_norm.std, self.y_norm.mean
         out = np.empty((n, horizon, S.shape[1]), dtype=np.float32)
@@ -187,25 +236,6 @@ class ProbWorldModel:
                 s = np.minimum(s, hi)
             out[:, h] = s
         return out
-
-    def save(self, path) -> str:
-        """Write the checkpoint; returns (and records in `meta`) its sha256."""
-        path = Path(path)
-        meta = {k: v for k, v in self.meta.items() if k != "sha256"}
-        torch.save({"state_dict": self.net.state_dict(), "arch": self.net.params(),
-                    "x_norm": (self.x_norm.mean, self.x_norm.std), "y_norm": (self.y_norm.mean, self.y_norm.std),
-                    "meta": meta}, path)
-        self.meta["sha256"] = sha256(path)
-        return self.meta["sha256"]
-
-    @classmethod
-    def load(cls, path) -> "ProbWorldModel":
-        ck = torch.load(path, weights_only=False)
-        net = ProbGRU(**ck["arch"])
-        net.load_state_dict(ck["state_dict"])
-        m = cls(net, Normalizer(*ck["x_norm"]), Normalizer(*ck["y_norm"]), ck.get("meta") or {})
-        m.meta["sha256"] = sha256(path)
-        return m
 
 
 def sha256(path) -> str:
@@ -238,12 +268,17 @@ def _windows(lengths: list[int], offsets: np.ndarray, length: int, burn_in: int,
     return np.array(starts, dtype=np.int64), np.array(first, dtype=bool)
 
 
-def train(train_data: list, val_data: list, context: int = CONTEXT, burn_in: int = BURN_IN, room: int = ROOM,
-          hidden: int = 128,
-          layers: int = 2, lr: float = 1e-3, batch: int = 256, epochs: int = 300, patience: int = 20,
-          seed: int = 0, log=None, max_seconds: float | None = None) -> tuple[ProbWorldModel, list[dict]]:
-    """Fit on per-episode (X [L, in], Y [L, out], M [L, out]) arrays; returns the best-validation model and
-    the per-epoch history {epoch, train_loss, val_loss, seconds}."""
+def fit_loop(make_net, seq_loss, train_data: list, val_data: list, context: int, burn_in: int, room: int,
+             lr: float, batch: int, epochs: int, patience: int, seed: int, log=None,
+             max_seconds: float | None = None):
+    """The training loop shared by the sampled world models.
+
+    Fits normalisers on the training data (Y on unmasked targets only), builds the network with
+    `make_net(in_dim, out_dim)` and minimises `seq_loss(net, x, y, m, keep, training)` over sequences of
+    `context + room` steps (`keep` [B, L, 1] is 0 on the burn-in positions of sequences that do not start
+    their episode) with Adam, early stopping on the validation loss. Returns the network with the
+    best-validation weights, the X and Y normalisers, the best validation loss and the per-epoch history
+    {epoch, train_loss, val_loss, seconds}."""
     if context <= burn_in or room < 0:
         raise ValueError("context must exceed burn_in and room must be >= 0")
     length = context + room
@@ -263,15 +298,14 @@ def train(train_data: list, val_data: list, context: int = CONTEXT, burn_in: int
     yn = _y_normalizer(Y, M)
     Xt, Yt, Mt = (torch.from_numpy(a) for a in (xn.transform(X), yn.transform(Y), M))
     Xvt, Yvt, Mvt = (torch.from_numpy(a) for a in (xn.transform(Xv), yn.transform(Yv), Mv))
-    net = ProbGRU(X.shape[1], Y.shape[1], hidden, layers)
+    net = make_net(X.shape[1], Y.shape[1])
     opt = torch.optim.Adam(net.parameters(), lr=lr)
     pos = torch.arange(length)
 
-    def loss_of(Xa, Ya, Ma, starts, first):
+    def loss_of(Xa, Ya, Ma, starts, first, training):
         idx = torch.from_numpy(starts)[:, None] + pos
-        mean, logvar, _ = net(Xa[idx])
         keep = ((pos >= burn_in)[None, :] | torch.from_numpy(first)[:, None]).float()[..., None]
-        return gaussian_nll(mean, logvar, Ya[idx], Ma[idx] * keep)
+        return seq_loss(net, Xa[idx], Ya[idx], Ma[idx], keep, training)
 
     vs, vf = _windows(Lv, offv, length, burn_in, 0)
     if not len(vs) or not len(_windows(L, off, length, burn_in, 0)[0]):
@@ -284,7 +318,7 @@ def train(train_data: list, val_data: list, context: int = CONTEXT, burn_in: int
         tot, cnt = 0.0, 0
         for i in range(0, len(perm), batch):
             b = perm[i:i + batch]
-            loss = loss_of(Xt, Yt, Mt, starts[b], first[b])
+            loss = loss_of(Xt, Yt, Mt, starts[b], first[b], True)
             opt.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(net.parameters(), 5.0)
@@ -293,7 +327,7 @@ def train(train_data: list, val_data: list, context: int = CONTEXT, burn_in: int
             cnt += len(b)
         net.eval()
         with torch.no_grad():
-            vl = sum(loss_of(Xvt, Yvt, Mvt, vs[i:i + 1024], vf[i:i + 1024]).item() * len(vs[i:i + 1024])
+            vl = sum(loss_of(Xvt, Yvt, Mvt, vs[i:i + 1024], vf[i:i + 1024], False).item() * len(vs[i:i + 1024])
                      for i in range(0, len(vs), 1024)) / len(vs)
         hist.append({"epoch": ep, "train_loss": tot / cnt, "val_loss": vl,
                      "seconds": round(time.perf_counter() - t0, 2)})
@@ -308,13 +342,31 @@ def train(train_data: list, val_data: list, context: int = CONTEXT, burn_in: int
         if max_seconds is not None and time.perf_counter() - t0 > max_seconds:
             break
     net.load_state_dict(best_state)
+    return net, xn, yn, best, hist
+
+
+def _pgru_loss(net, x, y, m, keep, training):
+    mean, logvar, _ = net(x)
+    return gaussian_nll(mean, logvar, y, m * keep)
+
+
+def train(train_data: list, val_data: list, context: int = CONTEXT, burn_in: int = BURN_IN, room: int = ROOM,
+          hidden: int = 128,
+          layers: int = 2, lr: float = 1e-3, batch: int = 256, epochs: int = 300, patience: int = 20,
+          seed: int = 0, log=None, max_seconds: float | None = None) -> tuple[ProbWorldModel, list[dict]]:
+    """Fit on per-episode (X [L, in], Y [L, out], M [L, out]) arrays; returns the best-validation model and
+    the per-epoch history {epoch, train_loss, val_loss, seconds}."""
+    net, xn, yn, best, hist = fit_loop(lambda i, o: ProbGRU(i, o, hidden, layers), _pgru_loss, train_data,
+                                       val_data, context, burn_in, room, lr, batch, epochs, patience, seed, log,
+                                       max_seconds)
     meta = {"context": context, "room": room, "burn_in": burn_in, "best_val_loss": best, "epochs_run": len(hist),
             "hidden": hidden, "layers": layers, "lr": lr, "batch": batch, "seed": seed}
     return ProbWorldModel(net, xn, yn, meta), hist
 
 
-def fit(store, train_seeds, val_seeds, **recipe) -> tuple[ProbWorldModel, list[dict]]:
-    """Train on history episodes; calibration, selection and held-out seeds are refused, as is overlap."""
+def fit_history(train_fn, store, train_seeds, val_seeds, **recipe):
+    """`train_fn(train_data, val_data, **recipe)` on history episodes, the training bounds and seeds added to
+    the model's meta; calibration, selection and held-out seeds are refused, as is overlap."""
     train_seeds, val_seeds = [int(s) for s in train_seeds], [int(s) for s in val_seeds]
     seed_ranges.check(train_seeds, "HISTORY")
     seed_ranges.check(val_seeds, "HISTORY")
@@ -322,12 +374,17 @@ def fit(store, train_seeds, val_seeds, **recipe) -> tuple[ProbWorldModel, list[d
         raise ValueError("training and validation seeds overlap")
     tr, va = features.episode_data(store, train_seeds), features.episode_data(store, val_seeds)
     S = np.concatenate([w.states for w in tr])
-    model, hist = train([features.steps(w) for w in tr], [features.steps(w) for w in va], **recipe)
+    model, hist = train_fn([features.steps(w) for w in tr], [features.steps(w) for w in va], **recipe)
     model.meta.update({"state_min": np.maximum(S.min(axis=0), 0.0).tolist(), "state_max": S.max(axis=0).tolist(),
                        "train_seeds": train_seeds, "val_seeds": val_seeds, "state_names": features.STATE_B,
                        "input_names": features.INPUT_B,
                        "n_train_steps": int(sum(len(w.states) - 1 for w in tr))})
     return model, hist
+
+
+def fit(store, train_seeds, val_seeds, **recipe) -> tuple[ProbWorldModel, list[dict]]:
+    """Train on history episodes; calibration, selection and held-out seeds are refused, as is overlap."""
+    return fit_history(train, store, train_seeds, val_seeds, **recipe)
 
 
 # ------------------------------------------------------------------ incident risk from futures
