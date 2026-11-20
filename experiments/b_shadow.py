@@ -532,7 +532,7 @@ def main(argv=None) -> dict:
     ap.add_argument("--predictors", default="all")
     ap.add_argument("--calibration", default="3400-3449")
     ap.add_argument("--selection", default="3450-3499")
-    ap.add_argument("--fit-seeds", default=None, help="history seeds (default: seed % 10 not 8 or 9)")
+    ap.add_argument("--fit-seeds", default=None, help="history seeds (default: seed %% 10 not 8 or 9)")
     ap.add_argument("--store", default=DEFAULT_STORE)
     ap.add_argument("--incident", default=DEFAULT_INCIDENT)
     ap.add_argument("--world-model", default=DEFAULT_WM)
