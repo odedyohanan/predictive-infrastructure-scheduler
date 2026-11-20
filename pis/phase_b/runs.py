@@ -13,6 +13,9 @@ from pis.privacy import scrub
 ROOT = Path(__file__).resolve().parents[2]
 SMOKE_PREFIX = "data/phase_b/smoke"     # smoke outputs live in directories starting with this
 LABELS = ("", "smoke")
+# the world model and raw output of the first shadow run: alarms configs that do not name theirs came from it
+SHADOW_WORLD_MODEL = "models/pgru_b1.pt"
+SHADOW_DIR = "results/raw/phase_b/shadow"
 
 
 def tree_dirty(ignore=()) -> bool:
@@ -84,6 +87,30 @@ def load_script(name: str):
 def write_note(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(scrub(text))
+
+
+def shadow_inputs(alarms: dict) -> dict:
+    """{"world_model", "shadow_dir"} of the shadow run an alarms config came from: as the config records them,
+    else (configs written before they were recorded) the first shadow run's."""
+    return {"world_model": alarms.get("world_model") or SHADOW_WORLD_MODEL,
+            "shadow_dir": alarms.get("shadow_dir") or SHADOW_DIR}
+
+
+def repo_path(path, keep_absolute: bool = False) -> str:
+    """`path` for a recorded config: relative paths as given, absolute ones under the repository relative to
+    it; any other absolute path kept (`keep_absolute`, smoke runs) or reduced by `privacy.safe_path`."""
+    from pis.privacy import safe_path
+    p = Path(path)
+    if not p.is_absolute():
+        return str(p)
+    try:
+        return str(p.relative_to(ROOT))
+    except ValueError:
+        pass
+    try:
+        return str(p.resolve().relative_to(ROOT.resolve()))
+    except ValueError:
+        return str(p) if keep_absolute else safe_path(str(p))
 
 
 def read_json(path: Path) -> dict:

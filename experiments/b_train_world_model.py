@@ -1,10 +1,20 @@
-"""Train the probabilistic GRU world model on history episodes and calibrate it on selection episodes.
+"""Train a sampled world model on history episodes and calibrate it on selection episodes.
 
   .venv/bin/python experiments/b_train_world_model.py --out models/pgru_b1.pt
+  .venv/bin/python experiments/b_train_world_model.py --arch rssm        # -> models/rssm_b2.pt
+  .venv/bin/python experiments/b_train_world_model.py --arch transformer # -> models/tf_b3.pt
   .venv/bin/python experiments/b_train_world_model.py --label smoke --seeds 3100-3119 \\
       --store data/phase_b/timing_probe --calib-seeds 3119 --horizon 6 --epochs 3 --hidden 16 \\
       --incident data/phase_b/smoke_g3/incident.json \\
       --smoke-dir data/phase_b/smoke_<name> --models-dir models/smoke_<name>
+
+`--arch`: "pgru" the probabilistic GRU (`pis.phase_b.wm_prob`, the default), "rssm" the recurrent
+state-space model (`pis.phase_b.wm_rssm`: deterministic GRU state + Gaussian latent, KL with free bits;
+`--latent`, `--free-bits`; `--layers` is then the depth of its prior, posterior and decoder networks),
+"transformer" the causal transformer (`pis.phase_b.wm_transformer`: `--d-model`, `--heads`, `--ff`,
+`--dropout`; `--layers` blocks, default 4; trained on sequences of exactly `--context` steps, so `--room`
+defaults to and must be 0). The default checkpoint is models/pgru_b1.pt, models/rssm_b2.pt or
+models/tf_b3.pt.
 
 History seeds split by seed % 10: 8 = validation (early stopping), 9 = test (never used here), the rest
 train. Calibration (`pis.phase_b.wm_prob.calibration`) runs on the selection seeds with the frozen incident
@@ -36,7 +46,11 @@ from pis.privacy import safe_path  # noqa: E402
 DEFAULT_STORE = "data/phase_b/history"
 DEFAULT_INCIDENT = "configs/phase_b/incident.json"
 DEFAULT_MC = "data/phase_b/mc_labels/labels.parquet"
-DEFAULT_OUT = "models/pgru_b1.pt"
+DEFAULT_OUT = {"pgru": "models/pgru_b1.pt", "rssm": "models/rssm_b2.pt", "transformer": "models/tf_b3.pt"}
+ARCH_NAMES = {"pgru": "Probabilistic GRU", "rssm": "Recurrent state-space (RSSM)",
+              "transformer": "Causal transformer"}
+DEFAULT_LAYERS = {"pgru": 2, "rssm": 1, "transformer": 4}
+DEFAULT_ROOM = {"pgru": 32, "rssm": 32, "transformer": 0}
 CALIB_SEEDS = "3450-3499"
 RULE_KEYS = ("k", "interval", "majority", "warmup", "H")
 
@@ -75,17 +89,48 @@ def read_incident(path: Path, horizon: int | None) -> dict:
 check_mc_config = runs.check_mc_config
 
 
+def arch_text(rec: dict) -> str:
+    """The recipe line of the note (and, for the RSSM and the transformer, the architecture before it)."""
+    if rec.get("arch", "pgru") == "transformer":
+        return (f"Architecture: causal transformer (`pis.phase_b.wm_transformer`): the 79-number input projected "
+                f"to d_model {rec['d_model']} plus a learned position embedding over the {rec['context']}-window "
+                f"context, {rec['layers']} pre-norm blocks (causal self-attention with {rec['heads']} heads, ReLU "
+                f"feed-forward of {rec['ff']}, dropout {rec['dropout']}), a Gaussian head over the change of the "
+                f"43 state numbers (standardised, log-variance clamped, p50/p99 masked without completions). "
+                f"Loss: masked Gaussian NLL; early stopping on the validation NLL. Rollouts: autoregressive over a "
+                f"sliding window of the last {rec['context']} steps (history, then sampled states), states clipped "
+                f"to the training range.\n\nRecipe: context {rec['context']} (room {rec['room']}), burn-in "
+                f"{rec['burn_in']}, d_model {rec['d_model']}, heads {rec['heads']}, feed-forward {rec['ff']}, "
+                f"layers {rec['layers']}, dropout {rec['dropout']}, lr {rec['lr']}, batch {rec['batch']}, patience "
+                f"{rec['patience']}, seed {rec['seed']}.")
+    if rec.get("arch", "pgru") != "rssm":
+        return (f"Recipe: context {rec['context']} (+ room {rec['room']}), burn-in {rec['burn_in']}, hidden "
+                f"{rec['hidden']} x {rec['layers']} layers, lr {rec['lr']}, batch {rec['batch']}, patience "
+                f"{rec['patience']}, seed {rec['seed']}.")
+    return (f"Architecture: recurrent state-space model (`pis.phase_b.wm_rssm`): deterministic GRU state of "
+            f"{rec['hidden']}, diagonal Gaussian latent of {rec['latent']} with prior p(z | h) and posterior "
+            f"q(z | h, change), decoder to a Gaussian over the change of the 43 state numbers (standardised, "
+            f"p50/p99 masked without completions); prior, posterior and decoder networks with {rec['layers']} "
+            f"hidden layer(s). Loss: masked Gaussian NLL + KL(q || p) floored at {rec['free_bits']} nats (free "
+            f"bits), per target number; early stopping on the validation negative ELBO. Rollouts: history "
+            f"filtered through the posterior, futures sampled through the prior, states clipped to the training "
+            f"range.\n\nRecipe: context {rec['context']} (+ room {rec['room']}), burn-in {rec['burn_in']}, "
+            f"hidden {rec['hidden']}, latent {rec['latent']}, layers {rec['layers']}, free bits "
+            f"{rec['free_bits']}, lr {rec['lr']}, batch {rec['batch']}, patience {rec['patience']}, seed "
+            f"{rec['seed']}.")
+
+
 def note_text(name: str, rec: dict, hist: list[dict], cal: dict, verdict) -> str:
     from pis.phase_b.wm_prob import NONZERO_OUTPUTS, OUTPUTS
     h = str(cal["horizon"])
-    lines = [f"# Probabilistic GRU world model {name}", "",
-             f"Checkpoint sha256 `{rec['sha256']}`; {rec['epochs_run']} epochs, best validation NLL "
+    arch = rec.get("arch", "pgru")
+    loss = "loss" if arch == "rssm" else "NLL"
+    lines = [f"# {ARCH_NAMES[arch]} world model {name}", "",
+             f"Checkpoint sha256 `{rec['sha256']}`; {rec['epochs_run']} epochs, best validation {loss} "
              f"{rec['best_val_loss']:.4f}; trained on {len(rec['train_seeds'])} history episodes "
              f"({rec['n_train_steps']} steps), validation {len(rec['val_seeds'])}; {rec['seconds']} s.", "",
-             f"Recipe: context {rec['context']} (+ room {rec['room']}), burn-in {rec['burn_in']}, hidden {rec['hidden']} x "
-             f"{rec['layers']} layers, lr {rec['lr']}, batch {rec['batch']}, patience {rec['patience']}, "
-             f"seed {rec['seed']}.", "",
-             "| epoch | train NLL | val NLL |", "|---|---|---|"]
+             arch_text(rec), "",
+             f"| epoch | train {loss} | val {loss} |", "|---|---|---|"]
     step = max(len(hist) // 10, 1)
     lines += [f"| {e['epoch']} | {e['train_loss']:.4f} | {e['val_loss']:.4f} |" for e in hist[::step]]
     lines += ["", f"## Calibration on {len(cal['seeds'])} episodes ({cal['starts']} starts, {cal['n']} samples, "
@@ -126,7 +171,9 @@ def main(argv=None) -> dict:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--seeds", default="3100-3399")
     ap.add_argument("--store", default=DEFAULT_STORE)
-    ap.add_argument("--out", default=DEFAULT_OUT)
+    ap.add_argument("--arch", default="pgru", choices=sorted(DEFAULT_OUT))
+    ap.add_argument("--out", default=None,
+                    help="default: models/pgru_b1.pt, models/rssm_b2.pt or models/tf_b3.pt by --arch")
     ap.add_argument("--incident", default=DEFAULT_INCIDENT)
     ap.add_argument("--mc-labels", default=DEFAULT_MC)
     ap.add_argument("--calib-seeds", default=CALIB_SEEDS)
@@ -137,12 +184,19 @@ def main(argv=None) -> dict:
     ap.add_argument("--epochs", type=int, default=300)
     ap.add_argument("--patience", type=int, default=20)
     ap.add_argument("--hidden", type=int, default=128)
-    ap.add_argument("--layers", type=int, default=2)
+    ap.add_argument("--layers", type=int, default=None, help="default: 2 (pgru), 1 (rssm), 4 (transformer)")
+    ap.add_argument("--latent", type=int, default=16, help="rssm only")
+    ap.add_argument("--free-bits", type=float, default=1.0, help="rssm only (nats)")
+    ap.add_argument("--d-model", type=int, default=64, help="transformer only")
+    ap.add_argument("--heads", type=int, default=4, help="transformer only")
+    ap.add_argument("--ff", type=int, default=128, help="transformer only (feed-forward width)")
+    ap.add_argument("--dropout", type=float, default=0.0, help="transformer only")
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--context", type=int, default=32)
     ap.add_argument("--burn-in", type=int, default=8)
-    ap.add_argument("--room", type=int, default=32, help="extra sequence length for rollouts (steps)")
+    ap.add_argument("--room", type=int, default=None,
+                    help="extra sequence length for rollouts (steps); default 32 (pgru, rssm), 0 (transformer)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--samples", type=int, default=64)
     ap.add_argument("--every", type=int, default=20)
@@ -153,6 +207,9 @@ def main(argv=None) -> dict:
     if a.label not in runs.LABELS:
         raise SystemExit(f"refusing to run: unknown label {a.label!r}")
     smoke = a.label == "smoke"
+    a.out = a.out or DEFAULT_OUT[a.arch]
+    a.layers = DEFAULT_LAYERS[a.arch] if a.layers is None else a.layers
+    a.room = DEFAULT_ROOM[a.arch] if a.room is None else a.room
     try:
         seeds = seed_ranges.parse(a.seeds)
         seed_ranges.check(seeds, "HISTORY")
@@ -192,7 +249,7 @@ def main(argv=None) -> dict:
         raise SystemExit("refusing to run: need training and validation (seed % 10 == 8) history seeds")
 
     import pandas as pd
-    from pis.phase_b import incidents, wm_prob
+    from pis.phase_b import incidents, wm_prob, world_models
     from pis.phase_b.history import Store
     store = Store(ROOT / a.store if not Path(a.store).is_absolute() else a.store)
     t0 = time.time()
@@ -206,21 +263,28 @@ def main(argv=None) -> dict:
 
     recipe = dict(context=a.context, burn_in=a.burn_in, room=a.room, hidden=a.hidden, layers=a.layers, lr=a.lr,
                   batch=a.batch, epochs=a.epochs, patience=a.patience, seed=a.seed)
+    if a.arch == "rssm":
+        recipe.update(latent=a.latent, free_bits=a.free_bits)
+    elif a.arch == "transformer":
+        del recipe["hidden"]
+        recipe.update(d_model=a.d_model, heads=a.heads, ff=a.ff, dropout=a.dropout)
+    fit = world_models.trainer(a.arch)
     try:
-        model, hist = wm_prob.fit(store, train_s, val_s, log=log, max_seconds=a.max_seconds, **recipe)
+        model, hist = fit(store, train_s, val_s, log=log, max_seconds=a.max_seconds, **recipe)
     except ValueError as e:
         raise SystemExit(f"refusing to run: {e}")
     train_seconds = round(time.time() - t0)
-    model.meta.update({"recipe": recipe, "store": safe_path(str(a.store)), "label": a.label})
+    model.meta.update({"arch": a.arch, "recipe": recipe, "store": safe_path(str(a.store)), "label": a.label})
     out.parent.mkdir(parents=True, exist_ok=True)
     sha = model.save(out)
     rec = {**recipe, "train_seeds": train_s, "val_seeds": val_s, "n_train_steps": model.meta["n_train_steps"],
            "best_val_loss": model.meta["best_val_loss"], "epochs_run": len(hist), "sha256": sha,
            "seconds": train_seconds, "store": safe_path(str(a.store)), "label": a.label,
-           "out": out.name, "trainer": "pis.phase_b.wm_prob.fit"}
+           "out": out.name, "arch": a.arch, "trainer": f"{fit.__module__}.fit"}
     runs.write_json(out.with_suffix(".recipe.json"), rec)
     runs.write_json(out.with_suffix(".history.json"), {"sha256": sha, "epochs": hist})
-    print(f"trained {len(hist)} epochs in {train_seconds} s, best val NLL {rec['best_val_loss']:.4f}", flush=True)
+    print(f"trained {a.arch} {len(hist)} epochs in {train_seconds} s, best val loss {rec['best_val_loss']:.4f}",
+          flush=True)
 
     rule = incidents.IncidentRule(int(inc["k"]), int(inc["interval"]), float(inc["majority"]))
     mc = pd.read_parquet(mc_path) if mc_path.exists() else None

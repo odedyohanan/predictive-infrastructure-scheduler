@@ -297,7 +297,9 @@ def test_shadow_end_to_end(shadow, tmp_path):
     assert raw[raw.window < 20][list(shadow.ALL)].isna().all().all()
     assert raw[raw.window >= 20][list(shadow.ALL)].notna().all().all()
     cfg = json.loads((tmp_path / "alarms.json").read_text())
-    assert set(cfg) == {"predictor", "threshold", "low", "H", "min_lead_windows", "alpha"}
+    assert set(cfg) == {"predictor", "threshold", "low", "H", "min_lead_windows", "alpha", "world_model",
+                        "shadow_dir"}
+    assert cfg["world_model"] == str(wm) and cfg["shadow_dir"] == str(tmp_path / "shadow")   # what readers use
     assert cfg["predictor"] == res["best"] and cfg["predictor"] is not None      # the synthetic rise is easy
     assert cfg["low"] == pytest.approx(0.7 * cfg["threshold"])
     p = res["predictors"][cfg["predictor"]]
@@ -402,3 +404,31 @@ def test_shadow_checks_the_monte_carlo_config(shadow, tmp_path):
     with pytest.raises(ValueError, match="horizon"):
         shadow.shadow(**args)
     assert not (tmp_path / "shadow").exists()
+
+
+def test_raw_dir_depends_on_the_world_model(shadow):
+    assert shadow.raw_dir_for("models/pgru_b1.pt") == "results/raw/phase_b/shadow"        # the first run's
+    assert shadow.raw_dir_for(None) == "results/raw/phase_b/shadow"
+    assert shadow.raw_dir_for("models/rssm_b2.pt") == "results/raw/phase_b/shadow_rssm_b2"
+    assert shadow.raw_dir_for("/elsewhere/models/tf_b3.pt") == "results/raw/phase_b/shadow_tf_b3"
+
+
+def test_real_run_writes_into_the_world_models_raw_dir(shadow, tmp_path, monkeypatch):
+    from pis.phase_b import runs
+    monkeypatch.setattr(runs, "tree_dirty", lambda ignore=(): False)
+    seen = []
+
+    def fake(store, rule, names, fit, cal, sel, wm, wm_n, mc, out, note, alarms_path, procs, label):
+        seen.append((wm, out, note, alarms_path))
+        return {"timing": {"ms_per_window": 1.0, "projected_h_one_proc": 0.0}, "best": None, "gate": ("g", "")}
+    monkeypatch.setattr(shadow, "shadow", fake)
+    (tmp_path / "labels.parquet").write_text("")
+    inc = shadow.ROOT / shadow.DEFAULT_INCIDENT
+    if not all(k in runs.read_json(inc) for k in ("k", "interval", "majority", "warmup", "H", "min_lead_windows")):
+        pytest.skip("the frozen incident config is not complete here")
+    shadow.main(["--mc-labels", str(tmp_path / "labels.parquet")])
+    shadow.main(["--mc-labels", str(tmp_path / "labels.parquet"), "--world-model", "models/rssm_b2.pt"])
+    (wm1, out1, note1, al1), (wm2, out2, note2, al2) = seen
+    assert out1 == shadow.ROOT / "results/raw/phase_b/shadow" and wm1 == "models/pgru_b1.pt"
+    assert out2 == shadow.ROOT / "results/raw/phase_b/shadow_rssm_b2" and wm2 == "models/rssm_b2.pt"
+    assert note1 == note2 == shadow.ROOT / shadow.NOTE and al1 == al2 == shadow.ROOT / shadow.ALARMS
