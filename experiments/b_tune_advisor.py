@@ -7,12 +7,13 @@ paired per seed; the config with the least time in incident that keeps the value
       --world-model models/smoke_g4/pgru_smoke.pt --fitted data/phase_b/smoke_g5/shadow/predictors.pkl \\
       --smoke-dir data/phase_b/smoke_<name>/tune
 
-Every seed runs R6 (the reference) and the advisor with eps in EPS_GRID x n in N_GRID (m = 4, h = min(H, 20))
-on the same scenario. The alarm predictor, its threshold and `low` come from the alarms config; the predictor
-is loaded as the shadow run used it (its fitted pickle, or the world model with the shadow run's number of
-futures; a real run refuses a world model other than the shadow run's); the advisor's futures come from
-`--world-model`. Reward weights (slo_lam, mu, change cost) are the
-Step A loop's (configs/step_a.json).
+Every seed runs R6 (the reference) and the advisor with eps in EPS_GRID x n in N_GRID (m = 4, h = min(H, 20)) on
+the same scenario. The alarm predictor, its threshold and `low` come from the alarms config; the predictor is
+loaded as the shadow run used it (its fitted pickle, or the world model with the shadow run's number of futures;
+a real run refuses a world model other than the shadow run's); the advisor's futures come from `--world-model`.
+`--world-model` and `--fitted` default to the world model and the shadow directory the alarms config records
+(models/pgru_b1.pt and results/raw/phase_b/shadow/ for a config that records none). Reward weights (slo_lam, mu,
+change cost) are the Step A loop's (configs/step_a.json).
 
 Per episode: time in incident (s), counted incidents, value per second, share of windows in intervention
 mode, fallback share, decision time; chronic = R6's episode spends more than half its windows in incident.
@@ -51,8 +52,7 @@ from pis.phase_b import seeds as seed_ranges  # noqa: E402
 
 DEFAULT_INCIDENT = "configs/phase_b/incident.json"
 DEFAULT_ALARMS = "configs/phase_b/alarms.json"
-DEFAULT_WM = "models/pgru_b1.pt"
-DEFAULT_FITTED = "results/raw/phase_b/shadow/predictors.pkl"
+FITTED_FILE = "predictors.pkl"
 STEP_A = "configs/step_a.json"
 CONFIG = "configs/phase_b/advisor.json"
 NOTE = "results/phase_b/advisor_dev.md"
@@ -84,7 +84,7 @@ def rule_of(inc: dict):
 
 def load_stack(alarms: dict, inc: dict, world_model, fitted, wm_n: int) -> dict:
     """Predictor (as the shadow run used it) and the advisor's world model."""
-    from pis.phase_b.wm_prob import ProbWorldModel
+    from pis.phase_b.world_models import load_world_model
     shadow = runs.load_script("b_shadow")
     name = alarms.get("predictor")
     pred = None
@@ -92,7 +92,7 @@ def load_stack(alarms: dict, inc: dict, world_model, fitted, wm_n: int) -> dict:
         pred = shadow.load_predictors(None if name == "world_model" else fitted, [name], inc, world_model,
                                       wm_n)[name]
     return {"predictor": pred, "predictor_name": name, "for_episode": shadow.for_episode,
-            "model": ProbWorldModel.load(world_model)}
+            "model": load_world_model(world_model)}
 
 
 class _NoRisk:
@@ -279,6 +279,16 @@ def note_text(cfg: dict, summary: dict, chosen: str | None, timing: dict) -> str
     return "\n".join(L) + "\n"
 
 
+def resolve_inputs(a, alarms: dict) -> None:
+    """Fill `a.world_model` and `a.fitted` left unset from the shadow run the alarms config came from;
+    explicit values stay."""
+    src = runs.shadow_inputs(alarms)
+    if a.world_model is None:
+        a.world_model = src["world_model"]
+    if a.fitted is None:
+        a.fitted = str(Path(src["shadow_dir"]) / FITTED_FILE)
+
+
 # ------------------------------------------------------------------ run
 def _git_head() -> str:
     p = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True)
@@ -343,8 +353,9 @@ def main(argv=None) -> dict:
     ap.add_argument("--duration", type=float, default=DURATION_S)
     ap.add_argument("--incident", default=DEFAULT_INCIDENT)
     ap.add_argument("--alarms", default=DEFAULT_ALARMS)
-    ap.add_argument("--world-model", default=DEFAULT_WM)
-    ap.add_argument("--fitted", default=DEFAULT_FITTED, help="the shadow run's predictors.pkl")
+    ap.add_argument("--world-model", default=None, help="default: the alarms config's world model")
+    ap.add_argument("--fitted", default=None, help="the shadow run's predictors.pkl (default: in the alarms "
+                                                   "config's shadow directory)")
     ap.add_argument("--wm-n", type=int, default=None, help="default: the shadow run's (32)")
     ap.add_argument("--procs", type=int, default=4)
     ap.add_argument("--label", default="")
@@ -379,6 +390,7 @@ def main(argv=None) -> dict:
         raise SystemExit(f"refusing to run: {a.incident} lacks {[k for k in need if k not in inc]}")
     if "H" not in alarms or "predictor" not in alarms:
         raise SystemExit(f"refusing to run: {a.alarms} is not an alarms config")
+    resolve_inputs(a, alarms)
     if not smoke and (alarms.get("predictor") is None or alarms.get("threshold") is None):
         raise SystemExit("refusing to run: the alarms config has no predictor with a threshold")
     step_a = json.loads((ROOT / STEP_A).read_text())["params"]

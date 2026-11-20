@@ -16,7 +16,8 @@ world model's sha256 (never overwritten). Smoke runs (`--label smoke`) may use h
 `--duration` and `--selection always` (every window from the warm-up on in intervention mode, the warm-up
 itself never: the worst case), allow a dirty tree, and write only into `--smoke-dir`. A real run reads the
 frozen configs/phase_b/{incident,alarms}.json, and they must match the rule and alarm the advisor config was
-tuned with.
+tuned with. `--world-model` and `--fitted` default to the world model and the shadow directory the alarms
+config records (models/pgru_b1.pt and results/raw/phase_b/shadow/ for a config that records none).
 """
 from __future__ import annotations
 
@@ -210,8 +211,9 @@ def main(argv=None) -> dict:
     ap.add_argument("--duration", type=float, default=DURATION_S)
     ap.add_argument("--incident", default="configs/phase_b/incident.json")
     ap.add_argument("--alarms", default="configs/phase_b/alarms.json")
-    ap.add_argument("--world-model", default="models/pgru_b1.pt")
-    ap.add_argument("--fitted", default="results/raw/phase_b/shadow/predictors.pkl")
+    ap.add_argument("--world-model", default=None, help="default: the alarms config's world model")
+    ap.add_argument("--fitted", default=None,
+                    help="default: predictors.pkl in the alarms config's shadow directory")
     ap.add_argument("--selection", default="model", choices=("model", "always"))
     ap.add_argument("--label", default="")
     ap.add_argument("--smoke-dir", default=None)
@@ -237,6 +239,7 @@ def main(argv=None) -> dict:
         raise SystemExit("refusing to run: " + "; ".join(errors))
     out = (runs.smoke_dir(a.smoke_dir) / "advisor_timing.md") if smoke else ROOT / NOTE
     cfg, inc, alarms = (runs.read_json(Path(p)) for p in (a.config, a.incident, a.alarms))
+    runs.load_script("b_tune_advisor").resolve_inputs(a, alarms)
     if not cfg.get("params"):
         raise SystemExit("refusing to run: the advisor config has no chosen params")
     if not smoke:
