@@ -125,3 +125,30 @@ def test_note_reports_in_mode_p95(timing):
                                   "selection": "model"}, {"params": {}}, "x", {})
     assert "- in-mode p95 (worst episode) 7.5 ms" in text and "| 7.5 |" in text
     assert "- worst per-episode p95 2.0 ms: within" in text
+
+
+def test_main_takes_world_model_and_fitted_from_the_alarms_config(timing, tmp_path, monkeypatch):
+    from pis.phase_b import runs
+    from tests.test_phase_b_wm_prob import _tiny_model
+    monkeypatch.setattr(runs, "ROOT", tmp_path)
+    seen = {}
+
+    def fake(seeds, duration_s, cfg, inc, alarms, world_model, fitted, selection="model"):
+        seen.update(world_model=world_model, fitted=fitted)
+        return {"p95_ok": True, "max_ok": True, "worst_p95": 1.0, "worst_max": 1.0}
+    monkeypatch.setattr(timing, "measure", fake)
+    monkeypatch.setattr(timing, "note_text", lambda *a, **kw: "note\n")
+    _tiny_model().save(tmp_path / "w.pt")
+    inc = {"k": 3, "interval": 12, "majority": 0.5, "warmup": 20, "H": 6}
+    alarms = {"predictor": "queueing", "threshold": 0.0, "low": 0.0, "H": 6, "world_model": str(tmp_path / "w.pt"),
+              "shadow_dir": str(tmp_path / "sh")}
+    cfg = {"params": {"m": 2}, "alarms": {k: alarms[k] for k in ("predictor", "threshold", "low", "H")}}
+    for name, obj in (("inc.json", inc), ("alarms.json", alarms), ("advisor.json", cfg)):
+        (tmp_path / name).write_text(json.dumps(obj))
+    args = ["--label", "smoke", "--seeds", "3450", "--duration", "10", "--config", str(tmp_path / "advisor.json"),
+            "--incident", str(tmp_path / "inc.json"), "--alarms", str(tmp_path / "alarms.json"),
+            "--tune-dir", str(tmp_path / "none"), "--smoke-dir", str(tmp_path / "data/phase_b/smoke_t")]
+    timing.main(args)
+    assert seen == {"world_model": str(tmp_path / "w.pt"), "fitted": str(tmp_path / "sh" / "predictors.pkl")}
+    timing.main(args + ["--fitted", "x/p.pkl"])
+    assert seen == {"world_model": str(tmp_path / "w.pt"), "fitted": "x/p.pkl"}

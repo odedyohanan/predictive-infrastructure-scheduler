@@ -680,3 +680,35 @@ def test_background_priority_is_read_from_the_process(monkeypatch):
     assert runs.background_priority() == (True, "macOS background QoS")
     monkeypatch.setattr(os, "getpriority", prio(5, None))
     assert runs.background_priority() == (True, "nice 5")
+
+
+def test_protocol_takes_world_model_and_shadow_dir_from_the_alarms_config(fe, tmp_path):
+    paths = _files(tmp_path)
+    alarms = json.loads((tmp_path / "alarms.json").read_text())
+    (tmp_path / "alarms.json").write_text(json.dumps({**alarms, "world_model": paths["world_model"],
+                                                      "shadow_dir": paths["shadow_dir"]}))
+    rest = {k: v for k, v in paths.items() if k not in ("world_model", "shadow_dir")}
+    p = fe.make_protocol(rest)
+    assert p["files"]["world_model"]["path"] == paths["world_model"]
+    assert p["files"]["shadow_risks"]["path"] == paths["shadow_dir"]
+    assert p["files"]["fitted"]["path"] == paths["shadow_dir"] + "/predictors.pkl"
+    (tmp_path / "alarms.json").write_text(json.dumps(alarms))          # a config that records neither
+    with pytest.raises(ValueError):                                     # -> the first run's files (absent here)
+        fe.make_protocol(rest)
+
+
+def test_official_files_follow_the_alarms_config(fe, tmp_path):
+    assert fe.official_files({})["world_model"] == "models/pgru_b1.pt"
+    assert fe.official_files({})["shadow_risks"] == "results/raw/phase_b/shadow"
+    off = fe.official_files({"world_model": "models/rssm_b2.pt", "shadow_dir": "results/raw/phase_b/shadow_rssm_b2"})
+    assert off["world_model"] == "models/rssm_b2.pt"
+    assert off["fitted"] == "results/raw/phase_b/shadow_rssm_b2/predictors.pkl"
+    assert off["shadow_config"] == "results/raw/phase_b/shadow_rssm_b2/config.json"
+    assert {k: v for k, v in off.items() if k not in ("world_model", "fitted", "shadow_config", "shadow_risks")} \
+        == {k: v for k, v in fe.OFFICIAL_FILES.items() if k not in ("world_model", "fitted", "shadow_config",
+                                                                     "shadow_risks")}
+    p = fe.make_protocol(_files(tmp_path))
+    p["files"] = {k: (None if v is None else {**v, "path": off.get(k, v["path"])}) for k, v in p["files"].items()}
+    assert fe.check_run(_official_args(fe), p, _state(official_files=off)) == []
+    errors = fe.check_run(_official_args(fe), p, _state())              # the first run's files are expected
+    assert any("world_model" in e for e in errors) and any("shadow_risks" in e for e in errors)

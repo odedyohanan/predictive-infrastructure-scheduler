@@ -2,6 +2,7 @@
 comparison of the learned predictors with the best non-learned one on development seeds.
 
   .venv/bin/python experiments/b_shadow.py --world-model models/pgru_b1.pt --procs 4
+  .venv/bin/python experiments/b_shadow.py --world-model models/rssm_b2.pt --procs 4   # -> shadow_rssm_b2/
   .venv/bin/python experiments/b_shadow.py --label smoke --store data/phase_b/timing_probe \\
       --incident data/phase_b/smoke_g3/lt/incident.json --world-model models/smoke_g4/pgru_smoke.pt \\
       --fit-seeds 3100-3103,3105-3107,3109,3110,3113,3115,3116,3118 --calibration 3104,3108,3111,3112 \\
@@ -26,11 +27,14 @@ predictor's building-up recall minus that of the better non-learned one, with a 
 selection episodes. The predictor with the best building-up recall (ties: lower false-alarm rate) goes to
 the alarms config; the note ends with the gate: recall <= 0.2 stops before prevention.
 
-Real runs: the full calibration (3400-3449) and selection (3450-3499) ranges, all five predictors, a clean
-tree, configs/phase_b/incident.json (rule, H, min_lead_windows), the Monte Carlo labels and a world model
-trained on history seeds only; outputs results/raw/phase_b/shadow/, configs/phase_b/alarms.json and
-results/phase_b/shadow_dev.md. Smoke runs (`--label smoke`) may use history episodes as stand-ins, allow a
-dirty tree and write only into `--smoke-dir`. Long runs go through scripts/gentle.sh.
+Real runs: the full calibration (3400-3449) and selection (3450-3499) ranges, all five predictors, a clean tree,
+configs/phase_b/incident.json (rule, H, min_lead_windows), the Monte Carlo labels and a world model trained on
+history seeds only; outputs the raw directory of the world model (results/raw/phase_b/shadow/ for
+models/pgru_b1.pt, results/raw/phase_b/shadow_<checkpoint name>/ for any other, so reruns with another world
+model never mix with earlier shards), configs/phase_b/alarms.json (which records the world model and that raw
+directory for the advisor scripts) and results/phase_b/shadow_dev.md. Smoke runs (`--label smoke`) may use
+history episodes as stand-ins, allow a dirty tree and write only into `--smoke-dir`. Long runs go through
+scripts/gentle.sh.
 """
 from __future__ import annotations
 
@@ -54,10 +58,10 @@ from pis.phase_b import seeds as seed_ranges  # noqa: E402
 DEFAULT_STORE = "data/phase_b/history"
 DEFAULT_INCIDENT = "configs/phase_b/incident.json"
 DEFAULT_MC = "data/phase_b/mc_labels/labels.parquet"
-DEFAULT_WM = "models/pgru_b1.pt"
+DEFAULT_WM = runs.SHADOW_WORLD_MODEL           # models/pgru_b1.pt
 ALARMS = "configs/phase_b/alarms.json"
 NOTE = "results/phase_b/shadow_dev.md"
-DEFAULT_OUT = "results/raw/phase_b/shadow"
+DEFAULT_OUT = runs.SHADOW_DIR                   # results/raw/phase_b/shadow
 ML = ("world_model", "hazard", "analogue")
 NON_ML = ("queueing", "change_point")
 ALL = ML + NON_ML
@@ -70,6 +74,12 @@ FITTED_FILE = "predictors.pkl"
 HIDDEN = ("deg_kind", "deg_active", "deg_factor")
 SOURCE = "r6"
 FULL_EPISODES, FULL_WINDOWS = 100, 600
+
+
+def raw_dir_for(world_model) -> str:
+    """Raw output directory of a real run with this world-model checkpoint."""
+    stem = Path(world_model).stem if world_model else Path(DEFAULT_WM).stem
+    return DEFAULT_OUT if stem == Path(DEFAULT_WM).stem else f"{DEFAULT_OUT}_{stem}"
 
 
 def default_fit_seeds() -> list[int]:
@@ -113,11 +123,11 @@ def load_predictors(fitted, names, rule: dict, world_model=None, wm_n: int = 32)
     from pis.phase_b import incidents, predictors
     preds = pickle.loads(Path(fitted).read_bytes()) if fitted is not None else {}
     if "world_model" in names:
-        from pis.phase_b.wm_prob import ProbWorldModel
+        from pis.phase_b.world_models import load_world_model
         if world_model is None:
             raise ValueError("the world-model predictor needs a checkpoint")
         rule_ = incidents.IncidentRule(rule["k"], rule["interval"], rule["majority"])
-        preds["world_model"] = predictors.WorldModelPredictor(ProbWorldModel.load(world_model), rule_,
+        preds["world_model"] = predictors.WorldModelPredictor(load_world_model(world_model), rule_,
                                                               n=wm_n, warmup=int(rule["warmup"]))
     missing = [n for n in names if n not in preds]
     if missing:
@@ -441,10 +451,10 @@ def shadow(store, rule: dict, names, fit_seeds, calibration, selection, world_mo
     warnings = []
     wm_sha = None
     if "world_model" in names:
-        from pis.phase_b.wm_prob import ProbWorldModel
+        from pis.phase_b.world_models import load_world_model
         if world_model is None or not Path(world_model).exists():
             raise ValueError("the world-model predictor needs an existing --world-model checkpoint")
-        m = ProbWorldModel.load(world_model)
+        m = load_world_model(world_model)
         wm_sha = m.meta["sha256"]
         seen = set(m.meta.get("train_seeds", [])) | set(m.meta.get("val_seeds", []))
         if label != "smoke" and (not seen or any(s not in seed_ranges.HISTORY for s in seen)):
@@ -521,7 +531,9 @@ def shadow(store, rule: dict, names, fit_seeds, calibration, selection, world_mo
     runs.write_json(Path(alarms_path), {
         "predictor": best, "threshold": results[best]["threshold"] if best else None,
         "low": results[best]["low"] if best else None, "H": int(rule["H"]),
-        "min_lead_windows": int(rule["min_lead_windows"]), "alpha": alarms.ALPHA})
+        "min_lead_windows": int(rule["min_lead_windows"]), "alpha": alarms.ALPHA,
+        "world_model": None if world_model is None else runs.repo_path(world_model, label == "smoke"),
+        "shadow_dir": runs.repo_path(out, label == "smoke")})
     runs.write_note(Path(note), note_text({**cfg, "warnings": warnings}, results, q1, best, g, timing))
     return {"predictors": results, "q1": q1, "best": best, "gate": g, "shards": res, "ms_per_window": ms,
             "timing": timing}
@@ -581,7 +593,7 @@ def main(argv=None) -> dict:
     if any(k not in inc for k in need):
         raise SystemExit(f"refusing to run: {a.incident} lacks {[k for k in need if k not in inc]}")
     rule = {k: inc[k] for k in need}
-    out = (sdir / "shadow") if smoke else ROOT / DEFAULT_OUT
+    out = (sdir / "shadow") if smoke else ROOT / raw_dir_for(a.world_model)
     note = (sdir / "shadow_dev.md") if smoke else ROOT / NOTE
     alarms_path = (sdir / "alarms.json") if smoke else ROOT / ALARMS
     try:

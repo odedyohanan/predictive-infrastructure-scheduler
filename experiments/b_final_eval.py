@@ -78,14 +78,26 @@ from pis.privacy import safe_path, scrub  # noqa: E402
 
 PROTOCOL = "configs/phase_b/final_eval.json"
 OFFICIAL_REPORT, OFFICIAL_RAW = "results/phase_b/final.md", "results/raw/phase_b/final"
+# world_model and shadow_dir: those the alarms config records (these for a config that records none)
 INPUTS = {"incident": "configs/phase_b/incident.json", "alarms": "configs/phase_b/alarms.json",
-          "advisor": "configs/phase_b/advisor.json", "world_model": "models/pgru_b1.pt",
-          "shadow_dir": "results/raw/phase_b/shadow", "timing_note": "results/phase_b/advisor_timing.md",
+          "advisor": "configs/phase_b/advisor.json", "world_model": runs.SHADOW_WORLD_MODEL,
+          "shadow_dir": runs.SHADOW_DIR, "timing_note": "results/phase_b/advisor_timing.md",
           "shadow_note": "results/phase_b/shadow_dev.md", "step_a": "configs/step_a.json",
           "phase_a_protocol": "configs/final_eval.json"}
-OFFICIAL_FILES = {**{k: v for k, v in INPUTS.items() if k != "shadow_dir"},
-                  "fitted": INPUTS["shadow_dir"] + "/predictors.pkl",
-                  "shadow_config": INPUTS["shadow_dir"] + "/config.json", "shadow_risks": INPUTS["shadow_dir"]}
+SHADOW_INPUTS = ("world_model", "shadow_dir")
+
+
+def official_files(alarms: dict | None = None) -> dict:
+    """The frozen input files of an official run; the world model and the shadow run's files are those the
+    alarms config `alarms` records (`runs.shadow_inputs`)."""
+    src = runs.shadow_inputs(alarms or {})
+    shadow_dir = src["shadow_dir"]
+    return {**{k: v for k, v in INPUTS.items() if k not in SHADOW_INPUTS}, "world_model": src["world_model"],
+            "fitted": shadow_dir + "/predictors.pkl", "shadow_config": shadow_dir + "/config.json",
+            "shadow_risks": shadow_dir}
+
+
+OFFICIAL_FILES = official_files()
 TRACKED = ("incident", "alarms", "advisor", "timing_note", "shadow_note", "step_a", "phase_a_protocol")
 ARMS = ("r6", "advisor", "loop_a", "advisor_random", "advisor_oracle", "always_on")
 SHADOW_ARMS = ("r6",)
@@ -202,11 +214,15 @@ def _gate(note: Path) -> str:
 def make_protocol(paths: dict | None = None, root: Path = ROOT, oracle_branches: int = ORACLE_BRANCHES,
                   oracle_horizon: int | None = None) -> dict:
     """The frozen protocol (written once to configs/phase_b/final_eval.json and committed on its own). `paths`
-    replaces the official input files (rehearsals only). The oracle arm branches `oracle_branches` times over
-    `oracle_horizon` windows (default: the advisor's h). The primary learned predictor of question 1 is read
-    from the shadow run's results (`primary_predictor`). Raises ValueError when an input is missing or
-    unusable."""
-    p = {**INPUTS, **{k: str(v) for k, v in (paths or {}).items() if v is not None}}
+    replaces the official input files (rehearsals only); the world model and the shadow directory not given there
+    are those the alarms config records (`runs.shadow_inputs`). The oracle arm branches `oracle_branches` times
+    over `oracle_horizon` windows (default: the advisor's h). The primary learned predictor of question 1 is read
+    from the shadow run's results (`primary_predictor`). Raises ValueError when an input is missing or unusable."""
+    given = {k: str(v) for k, v in (paths or {}).items() if v is not None}
+    p = {**INPUTS, **given}
+    alarms_path = _abs(p["alarms"], root)
+    recorded = runs.shadow_inputs(load_json(alarms_path) if alarms_path.is_file() else {})
+    p.update({k: recorded[k] for k in SHADOW_INPUTS if k not in given})
     variant = _gate(_abs(p["shadow_note"], root))
     inc = load_json(_abs(p["incident"], root))
     need = list(RULE_KEYS) + ["H", "min_lead_windows"]
@@ -438,7 +454,8 @@ def _section(text: str, attempt: int) -> str | None:
 def check_run(a: dict, protocol: dict, state: dict) -> list[str]:
     """Errors that refuse the run. `state`: dirty, committed {path: bool}, sha_mismatch [file keys], report_text,
     out_exists, raw_exists (this attempt), prev_raw_exists, freeze {commits, files}, run_config (this attempt's,
-    or None), code_changed."""
+    or None), code_changed, official_files (`official_files` of the frozen alarms config; default
+    OFFICIAL_FILES)."""
     errors = []
     seeds = list(a["seeds_list"])
     if not seeds:
@@ -462,9 +479,10 @@ def check_run(a: dict, protocol: dict, state: dict) -> list[str]:
                 errors.append(f"{safe_path(path)} is not committed at HEAD (or differs from it)")
         if _abs(a["protocol"]).resolve() != _abs(PROTOCOL).resolve():
             errors.append(f"a run on the held-out seeds reads {PROTOCOL} (--protocol)")
+        official = state.get("official_files") or OFFICIAL_FILES
         for key, v in protocol["files"].items():
-            if v is not None and Path(v["path"]) != Path(OFFICIAL_FILES[key]):
-                errors.append(f"the protocol's {key} is not the frozen {OFFICIAL_FILES[key]}")
+            if v is not None and Path(v["path"]) != Path(official[key]):
+                errors.append(f"the protocol's {key} is not the frozen {official[key]}")
         freeze = state.get("freeze", {"commits": [], "files": []})
         if len(freeze["commits"]) != 1 or freeze["files"] != [PROTOCOL]:
             errors.append(f"{PROTOCOL} must have exactly one commit, touching only that file (found "
@@ -1081,7 +1099,9 @@ def main(argv=None):
              "sha_mismatch": [k for k, v in files.items() if v and file_sha(k, v["path"]) != v["sha256"]],
              "report_text": out.read_text() if out.is_file() else "", "out_exists": out.exists(),
              "raw_exists": raw_attempt.exists(), "prev_raw_exists": (raw_root / f"attempt_{a.attempt - 1}").is_dir(),
-             "freeze": freeze_state(), "run_config": run_config, "code_changed": code_changed(run_config)}
+             "freeze": freeze_state(), "run_config": run_config, "code_changed": code_changed(run_config),
+             "official_files": official_files(load_json(_abs(INPUTS["alarms"]))
+                                              if _abs(INPUTS["alarms"]).is_file() else None)}
     state["background"], state["priority"] = runs.background_priority()
     args = {"seeds_list": seeds, "label": a.label, "duration": duration, "out": a.out, "raw_dir": a.raw_dir,
             "attempt": a.attempt, "resume": a.resume, "protocol": a.protocol}

@@ -149,3 +149,41 @@ def test_note_explains_the_eps_grid_with_few_futures(tune):
            "world_model_sha256": "x", "grid": tune.grid()}
     text = tune.note_text(cfg, {}, None, {"r6_s": 1.0, "advisor_s": 1.0, "projected_h": 1.0})
     assert "p = 0" in text and "n = 8" in text
+
+
+def test_inputs_default_to_the_shadow_run_the_alarms_config_records(tune):
+    from types import SimpleNamespace
+    alarms = {"predictor": "hazard", "H": 20, "world_model": "models/rssm_b2.pt",
+              "shadow_dir": "results/raw/phase_b/shadow_rssm_b2"}
+    a = SimpleNamespace(world_model=None, fitted=None)
+    tune.resolve_inputs(a, alarms)
+    assert a.world_model == "models/rssm_b2.pt"
+    assert a.fitted == "results/raw/phase_b/shadow_rssm_b2/predictors.pkl"
+    a = SimpleNamespace(world_model=None, fitted=None)
+    tune.resolve_inputs(a, {"predictor": "hazard", "H": 20})            # written before they were recorded
+    assert (a.world_model, a.fitted) == ("models/pgru_b1.pt", "results/raw/phase_b/shadow/predictors.pkl")
+    a = SimpleNamespace(world_model="models/x.pt", fitted="elsewhere/p.pkl")
+    tune.resolve_inputs(a, alarms)                                      # explicit flags win
+    assert (a.world_model, a.fitted) == ("models/x.pt", "elsewhere/p.pkl")
+
+
+def test_main_takes_world_model_and_fitted_from_the_alarms_config(tune, tmp_path, monkeypatch):
+    from pis.phase_b import runs
+    monkeypatch.setattr(runs, "ROOT", tmp_path)
+    seen = {}
+
+    def fake(seeds, duration_s, inc, alarms, world_model, fitted, *a, **kw):
+        seen.update(world_model=world_model, fitted=fitted)
+        return {"chosen": None, "timing": {"projected_h": 0.0}}
+    monkeypatch.setattr(tune, "tune", fake)
+    inc = {"k": 3, "interval": 12, "majority": 0.5, "warmup": 20, "H": 6}
+    (tmp_path / "inc.json").write_text(json.dumps(inc))
+    alarms = {"predictor": "queueing", "threshold": 0.1, "low": 0.07, "H": 6, "world_model": str(tmp_path / "w.pt"),
+              "shadow_dir": str(tmp_path / "sh")}
+    (tmp_path / "alarms.json").write_text(json.dumps(alarms))
+    args = ["--label", "smoke", "--seeds", "3450", "--incident", str(tmp_path / "inc.json"), "--alarms",
+            str(tmp_path / "alarms.json"), "--smoke-dir", str(tmp_path / "data/phase_b/smoke_t")]
+    tune.main(args)
+    assert seen == {"world_model": str(tmp_path / "w.pt"), "fitted": str(tmp_path / "sh" / "predictors.pkl")}
+    tune.main(args + ["--world-model", "models/other.pt", "--fitted", "x/p.pkl"])
+    assert seen == {"world_model": "models/other.pt", "fitted": "x/p.pkl"}
