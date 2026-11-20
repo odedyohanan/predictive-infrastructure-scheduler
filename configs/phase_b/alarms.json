@@ -1,0 +1,8 @@
+{
+  "H": 20,
+  "alpha": 0.1,
+  "low": 0.26599999999999996,
+  "min_lead_windows": 1,
+  "predictor": "analogue",
+  "threshold": 0.38
+}
