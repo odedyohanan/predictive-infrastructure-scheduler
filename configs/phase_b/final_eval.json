@@ -1,0 +1,145 @@
+{
+ "name": "incident advisor: final paired evaluation",
+ "variant": "shadow_only",
+ "seeds": {
+  "first": 3000,
+  "last": 3099
+ },
+ "duration_s": 300.0,
+ "scenario": "pis.phase_b.scenarios.scenario_for(seed): spec and degradation fixed by the seed, not announced to any controller; 500 ms windows; every arm starts from the same policy",
+ "reference_arm": "r6",
+ "arms": {
+  "r6": {
+   "role": "reference: the R6 RL student, greedy (models/rl_r6/final.pt of the scheduler repo)"
+  }
+ },
+ "oracle": null,
+ "shard_size": 5,
+ "files": {
+  "incident": {
+   "path": "configs/phase_b/incident.json",
+   "sha256": "1a455ffb1046943442bd0b1ec6313f469ddaaaaf6362d6ee2b19908c78687bfc"
+  },
+  "alarms": {
+   "path": "configs/phase_b/alarms.json",
+   "sha256": "bee5e521a8c59095b2d27667cc96c114897ab20b73a3e5b6b6a2deea0bbc871e"
+  },
+  "world_model": {
+   "path": "models/tf_b3.pt",
+   "sha256": "cbac9449d272a82de33d2988a30eb3f164e758213990954fd72cfc0ba9db741f"
+  },
+  "shadow_note": {
+   "path": "results/phase_b/shadow_dev.md",
+   "sha256": "8163b8203885cc70abc3c6c66e576c598c77610289e6d4f62d165214b951ea3d"
+  },
+  "step_a": {
+   "path": "configs/step_a.json",
+   "sha256": "2afb3198e4314fff4f84993c6776b64379149d4ea825cf11a44793e71ad7cd73"
+  },
+  "phase_a_protocol": {
+   "path": "configs/final_eval.json",
+   "sha256": "26b75314c5226a21da751e2419d64e28df4c611368b9a4e98496007b6017a0ea"
+  },
+  "fitted": {
+   "path": "results/raw/phase_b/shadow_tf_b3/predictors.pkl",
+   "sha256": "882f23e5682034b0899bb5857f6644d881666b723034bce8c89cae5104c30bf1"
+  },
+  "shadow_config": {
+   "path": "results/raw/phase_b/shadow_tf_b3/config.json",
+   "sha256": "b5953668410a4259c60ef805b7995832faff95c34448b88d8327e07b55ab423d"
+  },
+  "shadow_risks": {
+   "path": "results/raw/phase_b/shadow_tf_b3",
+   "sha256": "1796cfdde9cb36c43016b18b4de539d560695d7e0807e9c036bed35d48e64902"
+  },
+  "advisor": null,
+  "timing_note": null
+ },
+ "predictors": {
+  "names": [
+   "world_model",
+   "hazard",
+   "analogue",
+   "queueing",
+   "change_point"
+  ],
+  "ml": [
+   "world_model",
+   "hazard",
+   "analogue"
+  ],
+  "non_ml": [
+   "queueing",
+   "change_point"
+  ],
+  "wm_n": 32,
+  "thresholds": "conformal on the shadow run's calibration episodes (alpha 0.1, low = 0.7 x threshold), recomputed from its risks, never refitted on held-out episodes"
+ },
+ "metrics": {
+  "per_arm_and_seed": [
+   "time_in_incident_s",
+   "incidents",
+   "incidents and time by cause",
+   "value_per_s",
+   "slo_v2_pct",
+   "decide_ms_p95",
+   "decide_ms_max",
+   "mode_share (intervention rate)",
+   "fallback_share",
+   "risk_nan"
+  ],
+  "incident_rule": {
+   "k": 19,
+   "interval": 76,
+   "majority": 0.5,
+   "warmup": 20,
+   "H": 20,
+   "min_lead_windows": 1
+  },
+  "cause": "building_up = the incident's onset falls while a degradation is active; sudden otherwise",
+  "false_alarm_cost": "paired (arm - r6) value_per_s over non-chronic episodes without a counted r6 incident",
+  "predictors_on_held_out": "recall by cause at lead >= min_lead_windows, median lead, false-alarm rate, alarms per quiet episode, Brier of the window risk against the realised outcome (a new counted onset within H)"
+ },
+ "success_rule": {
+  "question_2": "not attempted",
+  "question_1": {
+   "names": [
+    "world_model",
+    "hazard",
+    "analogue",
+    "queueing",
+    "change_point"
+   ],
+   "ml": [
+    "world_model",
+    "hazard",
+    "analogue"
+   ],
+   "non_ml": [
+    "queueing",
+    "change_point"
+   ],
+   "cause": "building_up",
+   "min_lead_windows": 1,
+   "primary": "analogue",
+   "secondary": [
+    "world_model",
+    "hazard"
+   ],
+   "primary_choice": "the learned predictor with the best building-up recall on the shadow run's SELECTION episodes (ties: lower false-alarm rate), fixed before any held-out run",
+   "rule": "the primary learned predictor's held-out building-up recall minus that of the better non-learned predictor; success when the bootstrap 95% interval over episodes lies above zero. The other learned predictors are secondary: their intervals are reported, no success is claimed for them",
+   "bootstrap": {
+    "reps": 2000,
+    "tag": 14000,
+    "conf": 0.95
+   }
+  },
+  "not_decidable": "question 2 is not decidable (never a success) when any r6 or advisor run of the attempt failed; question 1 is not decidable when any r6 run or its predictor scoring failed (those episodes are excluded and counted)",
+  "otherwise": "any other result is reported as it is; an interval including zero is no detectable difference"
+ },
+ "failure_handling": "a run that raises is recorded with a scrubbed message and listed, never dropped or replaced; pairs use the seeds where both arms ran. A crash or a bug: fix, rerun as the next attempt, report every attempt; no tuning on these results.",
+ "outputs": {
+  "report": "results/phase_b/final.md",
+  "raw": "results/raw/phase_b/final/attempt_<N>/"
+ }
+}
