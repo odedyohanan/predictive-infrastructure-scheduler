@@ -84,6 +84,8 @@ What this says, plainly:
 - **There is headroom.** An oracle that scores the same candidates in the real simulator gains another +145
   value/s over Step A (at a much higher SLO risk), so a better world model, not a better search, is the
   bottleneck.
+  This oracle is an inflated upper bound: its simulator branches (and those of Step 0's ground truth) shared
+  the same future random bursts, so the oracle saw the future the chosen policy would meet.
 
 ### How we got there (development seeds)
 
@@ -107,12 +109,66 @@ What this says, plainly:
 Selection on development seeds makes those numbers optimistic; only the held-out evaluation measures the
 chosen configurations.
 
+## Results (Phase B): incident advisor
+
+Phase B asked two questions on a harder world: scenarios of 300 s with injected degradations (load ramps,
+memory leaks, interference, CPU loss, and distractors that should not raise alarms). **Question 1:** can a
+learned predictor warn about an SLO incident early enough, better than predictors that learn nothing?
+**Question 2:** if so, can an advisor that switches the scheduler into a careful mode on the alarm cut the time
+spent in incidents? A gate between them: if no predictor catches building-up incidents (recall above 0.2 at
+the calibrated false-alarm rate), prevention is not attempted.
+
+**Answer: no on question 1, so question 2 was not attempted.** On 100 held-out scenarios (seeds 3000-3099,
+frozen protocol, one attempt, R6 only), the pre-registered primary learned predictor (nearest-neighbour
+analogues, chosen on development seeds) caught 1 of 21 building-up incidents: +0.05 [0.00, 0.18] over the
+better non-learned predictor, which caught none. [results/phase_b/final.md](results/phase_b/final.md)
+
+| predictor | building-up recall | sudden recall | false-alarm rate | Brier (window risk) |
+|---|---|---|---|---|
+| world model (transformer, rollouts) | 0.29 (6/21) | 0.11 (1/9) | 0.67 | 0.074 |
+| analogue kNN (primary) | 0.05 (1/21) | 0.00 (0/9) | 0.97 | 0.011 |
+| hazard (logistic) | 0.00 | 0.00 | 1.00 | 0.010 |
+| queueing model (no learning) | 0.00 | 0.00 | 1.00 | 0.210 |
+| change point (no learning) | 0.00 | 0.00 | no feasible threshold | 0.070 |
+
+- **The world model is the only predictor that caught a useful share**, +0.29 [+0.08, +0.54] over the better
+  non-learned predictor on held-out scenarios. It was a secondary predictor in the protocol (it tied with the
+  analogue on development seeds, 2 of 10, and lost the tie on false alarms), so this is a lead, not a result.
+- **Alarms are mostly false.** With thresholds calibrated by conformal risk control (alpha 0.1) on development
+  episodes, two thirds or more of the alarm events of every predictor were not followed by an incident within
+  H = 20 windows on held-out scenarios: the calibration did not transfer, and few incidents (10 building-up in
+  the selection episodes) make every rate noisy.
+- **Low Brier is not detection.** Hazard and analogue have the best Brier scores because they predict the base
+  rate almost everywhere.
+- **No world model met the calibration bar** ([results/phase_b/wm_pgru_b1.md](results/phase_b/wm_pgru_b1.md),
+  [wm_rssm_b2.md](results/phase_b/wm_rssm_b2.md), [wm_tf_b3.md](results/phase_b/wm_tf_b3.md)): 80 % intervals
+  covering 70-90 % at H for queue overdue, late requests and p99 latency, and incident-risk Brier skill above
+  zero against Monte Carlo labels. All three rungs (probabilistic GRU, RSSM, causal transformer) failed; the
+  transformer failed fewest criteria and was used by the rule fixed before the rungs were compared. The RSSM
+  had by far the best risk Brier (skill -0.04 against -1.1 and -1.5).
+- **Preventive interventions rarely matter** ([results/phase_b/lead_time.md](results/phase_b/lead_time.md)):
+  in 4 of 24 sampled pre-incident states did any intervention change the outcome measurably, so even a good
+  alarm would have had little to act on.
+
+### How we got there (development seeds)
+
+400 history episodes from varied policies ([history.md](results/phase_b/history.md)); a frozen incident rule
+(19 of 76 windows in violation, new onsets only, 20 warm-up windows; [incident_rule.md](results/phase_b/incident_rule.md));
+Monte Carlo risk labels for 300 states with multilevel splitting, because the plain estimate was zero in 85 %
+of them ([mc_labels.md](results/phase_b/mc_labels.md)); shadow mode of five predictors on 50 calibration and
+50 selection episodes, rerun once per world-model rung ([shadow_dev.md](results/phase_b/shadow_dev.md) and its
+git history). Every rung stopped at the gate.
+
 ## Caveats
 
 - One laptop, one simulator family, 60 s scenarios. The simulator is "reality" by construction; nothing here
   touches a real cluster.
 - The official decision-time check uses 3 development scenarios at normal priority. Under background priority
   in the final run (several processes on efficiency cores) Step B exceeded 500 ms in 8 decisions.
+- Phase B: 300 s scenarios with one injected degradation each; 10 building-up incidents in the selection
+  episodes and 21 in the held-out ones, so recalls and false-alarm rates are coarse. The Monte Carlo labels use
+  300 states x 16 branches (a full-size run did not fit a night). The rollout world-model predictor is slow
+  (about 0.5 s per window for the transformer on one efficiency core).
 - The base scheduler R6 is the reference throughout and never changed. The world-model ensemble members 1-4
   were trained here with the sibling repo's recipe on different seeds; their checkpoints are not in git.
 
@@ -147,6 +203,13 @@ scripts/stop.sh
 | `experiments/tune_step_b.py` | Step B tuning (and re-selection from saved runs) |
 | `experiments/time_decisions.py` | decision time at normal priority |
 | `experiments/final_eval.py` | the frozen final paired evaluation |
+| `experiments/b_generate_history.py` | Phase B history episodes (degraded scenarios, varied policies) |
+| `experiments/b_incident_rule.py`, `b_lead_time.py` | incident rule and minimum useful lead time |
+| `experiments/b_mc_labels.py` | Monte Carlo incident-risk labels |
+| `experiments/b_train_world_model.py` | probabilistic world models (`--arch` pgru, rssm or transformer) |
+| `experiments/b_shadow.py` | shadow mode: five predictors, conformal alarms, the gate |
+| `experiments/b_tune_advisor.py`, `b_time_advisor.py` | advisor tuning and decision time (not reached) |
+| `experiments/b_final_eval.py` | the frozen Phase B final evaluation |
 
 ## Layout
 
@@ -156,8 +219,11 @@ statistics); `experiments/` one script per step; `configs/` chosen configuration
 
 ## Next
 
-Phase A asked whether imagination helps at all. The oracle gap points at the world model as the next thing to
-improve (training on the loop's own decisions, other architectures), before more elaborate search.
+Phase A asked whether imagination helps at all; the oracle gap pointed at the world model. Phase B found that
+better calibrated world models are still not enough to warn about incidents reliably on this simulator, while
+the rollout world model was the only predictor with a useful catch rate. The next step is a faster simulator
+(to afford far more history, labels and incidents) and then a world model trained and judged on the incident
+outputs directly.
 
 ## License
 
