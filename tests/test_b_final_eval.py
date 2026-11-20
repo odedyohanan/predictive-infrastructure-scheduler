@@ -694,7 +694,7 @@ def test_protocol_takes_world_model_and_shadow_dir_from_the_alarms_config(fe, tm
     assert p["files"]["fitted"]["path"] == paths["shadow_dir"] + "/predictors.pkl"
     (tmp_path / "alarms.json").write_text(json.dumps(alarms))          # a config that records neither
     with pytest.raises(ValueError):                                     # -> the first run's files (absent here)
-        fe.make_protocol(rest)
+        fe.make_protocol(rest, root=tmp_path / "empty")
 
 
 def test_official_files_follow_the_alarms_config(fe, tmp_path):
