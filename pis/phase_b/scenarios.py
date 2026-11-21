@@ -17,7 +17,7 @@ from typing import Literal
 
 import numpy as np
 
-from pis.adapters import clone_sim, make_spec
+from pis.adapters import clone_sim, make_spec, simulator_class
 from pis.config import setup_imports
 
 setup_imports()
@@ -144,7 +144,7 @@ class DegradedSim:
 
     def __post_init__(self):
         sc = self.scenario
-        self.sim = Simulator(sc.spec, sc.seed, sc.duration_s)
+        self.sim = simulator_class()(sc.spec, sc.seed, sc.duration_s)
 
     def run_window(self, policy: dict) -> dict:
         d = self.scenario.degradation
