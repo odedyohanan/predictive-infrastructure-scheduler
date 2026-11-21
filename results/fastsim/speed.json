@@ -1,0 +1,88 @@
+{
+  "background": {
+    "commit": "492793e376d990d8acef2113a9bb6b26d1eab6ce",
+    "duration_s": null,
+    "machine": "Darwin arm64",
+    "priority": "background",
+    "priority_detail": "macOS background QoS",
+    "rows": [
+      {
+        "episode_fast_s": 3.0714253339683637,
+        "episode_python_s": 87.1593359579565,
+        "kind": "none",
+        "queue_len_max": 15,
+        "same_policies": true,
+        "seed": 3100,
+        "sim_fast_s": 0.4938842919655144,
+        "sim_python_s": 90.77470220800024,
+        "windows": 600
+      },
+      {
+        "episode_fast_s": 3.5898841669550166,
+        "episode_python_s": 99.52780750009697,
+        "kind": "gpu_loss",
+        "queue_len_max": 27,
+        "same_policies": true,
+        "seed": 3101,
+        "sim_fast_s": 1.27786270796787,
+        "sim_python_s": 94.4191204579547,
+        "windows": 600
+      },
+      {
+        "episode_fast_s": 3.449319332954474,
+        "episode_python_s": 95.62827970797662,
+        "kind": "none",
+        "queue_len_max": 290,
+        "same_policies": true,
+        "seed": 3102,
+        "sim_fast_s": 1.3717156250495464,
+        "sim_python_s": 93.3682124579791,
+        "windows": 600
+      }
+    ],
+    "warm_up_s": 0.7222403750056401
+  },
+  "normal": {
+    "commit": "d5d25093dc7fa99e13c330f74a8c6e84c803eeb3",
+    "duration_s": null,
+    "machine": "Darwin arm64",
+    "priority": "normal",
+    "priority_detail": "nice 0",
+    "rows": [
+      {
+        "episode_fast_s": 0.466323500033468,
+        "episode_python_s": 13.56170524994377,
+        "kind": "none",
+        "queue_len_max": 15,
+        "same_policies": true,
+        "seed": 3100,
+        "sim_fast_s": 0.18130624992772937,
+        "sim_python_s": 12.872149750008248,
+        "windows": 600
+      },
+      {
+        "episode_fast_s": 0.49724270799197257,
+        "episode_python_s": 13.444861541036516,
+        "kind": "gpu_loss",
+        "queue_len_max": 27,
+        "same_policies": true,
+        "seed": 3101,
+        "sim_fast_s": 0.1955639999359846,
+        "sim_python_s": 13.205522957956418,
+        "windows": 600
+      },
+      {
+        "episode_fast_s": 0.4573262499179691,
+        "episode_python_s": 13.108965791063383,
+        "kind": "none",
+        "queue_len_max": 290,
+        "same_policies": true,
+        "seed": 3102,
+        "sim_fast_s": 0.20217833295464516,
+        "sim_python_s": 12.894598292070441,
+        "windows": 600
+      }
+    ],
+    "warm_up_s": 0.10374974994920194
+  }
+}

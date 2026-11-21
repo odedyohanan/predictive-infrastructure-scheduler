@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import os
 
 import numpy as np
 
@@ -26,8 +27,19 @@ def make_spec(seed: int):
     return random_spec(np.random.default_rng(900000 + seed))
 
 
+def simulator_class() -> type:
+    """The simulator to build: the compiled `FastSimulator` when PIS_FAST_SIM=1, else the Python `Simulator`.
+
+    Read at call time. Both produce identical telemetry; the Python one stays the default.
+    """
+    if os.environ.get("PIS_FAST_SIM") == "1":
+        from pis.fastsim import FastSimulator
+        return FastSimulator
+    return Simulator
+
+
 def make_sim(seed: int, duration_s: float = 60.0) -> Simulator:
-    return Simulator(make_spec(seed), seed, duration_s)
+    return simulator_class()(make_spec(seed), seed, duration_s)
 
 
 def known_of(spec) -> dict:
