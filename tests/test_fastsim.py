@@ -7,6 +7,7 @@ windows side by side. The full side-by-side check over hundreds of episodes is e
 """
 import copy
 import dataclasses
+from collections import deque
 
 import numpy as np
 import pytest
@@ -47,7 +48,7 @@ def _fork_python(sim):
     c = copy.deepcopy(sim)
     py = Simulator.__new__(Simulator)
     py.__dict__.update({k: v for k, v in c.__dict__.items() if not k.startswith("_q")})
-    py.queue = c.queue
+    py.queue = deque(list(r) for r in c.queue)
     return py
 
 
@@ -105,6 +106,32 @@ def test_fast_matches_python_fixed_policies(seed):
     _lockstep(py, fast, [policy() for _ in range(3)])
 
 
+def test_fast_matches_python_overload_from_start():
+    """A pinned to one CPU: the queue outgrows the initial array capacity (4096), side by side from t=0."""
+    seed = 7
+    spec = adapters.make_spec(seed)
+    pol = Policy(1, 500, [WorkloadPolicy([0], 99, "interactive", []), WorkloadPolicy([1, 2, 3], 50, "batch", [0]),
+                          WorkloadPolicy([], 50, "best_effort", [1])])
+    py, fast = Simulator(spec, seed, 60.0), FastSimulator(spec, seed, 60.0)
+    while len(fast.queue) <= 6000:
+        assert py.run_window(pol) == fast.run_window(pol)
+        assert fast.t < 20.0
+    _assert_same_state(py, fast)
+
+
+def test_fast_queue_is_read_only():
+    sim = FastSimulator(adapters.make_spec(1), 1, 5.0)
+    sim.run_window(isolated_policy())
+    q = sim.queue
+    with pytest.raises(AttributeError):
+        q.append((-1.0, 1e9, 0.0, False))
+    if q:
+        with pytest.raises(TypeError):
+            q[0][1] = 0.0
+    sim.queue = list(q) + [(-1.0, 1e9, 0.0, False)]           # assignment is the supported way
+    assert sim.queue[-1] == (-1.0, 1e9, 0.0, False) and len(sim.queue) == len(q) + 1
+
+
 def _seed_of_kind(kind: str) -> int:
     return next(s for s in seeds.HISTORY if scenarios.scenario_for(s).kind == kind)
 
@@ -159,10 +186,13 @@ def test_fast_matches_python_degraded(kind, monkeypatch):
     assert np.array_equal(c_py.sim.bursts, c_fast.sim.bursts)
     _lockstep_dsim(c_py, c_fast, 3, walk)
 
-    _advance(fast, sc.duration_s, walk)                        # the rest of the 300 s episode
-    assert fast.done()
+    _advance(fast, sc.duration_s - 2.0, walk)                  # the rest of the 300 s episode...
     py = _fork_dsim(fast)
-    _assert_same_state(py.sim, fast.sim)
+    n = 0
+    while not fast.done():                                     # ...with its last windows side by side
+        _lockstep_dsim(py, fast, 1, walk)
+        n += 1
+    assert n == 4 and py.done()
 
 
 def test_fast_matches_python_r6_episode(monkeypatch):

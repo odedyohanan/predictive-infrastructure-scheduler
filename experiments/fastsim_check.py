@@ -103,7 +103,11 @@ def run_one(kind: str, seed: int, fast: bool, duration_s: float | None) -> tuple
         records = run_scenario(seed, ctl, duration_s or PHASE_A_DURATION_S)
     wall = time.time() - t0
     sim = ctl.sim
-    state = {"rng": sim.rng.bit_generator.state, "backlog": sim.backlog(), "t": sim.t,
+    want = "FastSimulator" if fast else "Simulator"
+    if type(sim).__name__ != want:
+        raise RuntimeError(f"expected the {want} class, the episode ran on {type(sim).__name__}")
+    state = {"class": type(sim).__name__, "rng": sim.rng.bit_generator.state, "backlog": sim.backlog(),
+             "t": sim.t,
              "queue": [list(r) for r in sim.queue]}
     return [untimed(r) for r in records], state, wall
 
@@ -111,8 +115,9 @@ def run_one(kind: str, seed: int, fast: bool, duration_s: float | None) -> tuple
 def check_one(kind: str, seed: int, duration_s: float | None) -> dict:
     py, py_state, py_wall = run_one(kind, seed, False, duration_s)
     fa, fa_state, fa_wall = run_one(kind, seed, True, duration_s)
-    res = {"kind": kind, "seed": seed, "windows": len(py), "equal_windows": 0, "mismatch": None,
-           "state_equal": py_state == fa_state, "wall_python_s": py_wall, "wall_fast_s": fa_wall}
+    classes = (py_state.pop("class"), fa_state.pop("class"))
+    res = {"kind": kind, "seed": seed, "classes": list(classes), "windows": len(py), "equal_windows": 0,
+           "mismatch": None, "state_equal": py_state == fa_state, "wall_python_s": py_wall, "wall_fast_s": fa_wall}
     if len(py) != len(fa):
         res["mismatch"] = {"window": min(len(py), len(fa)), "key": f"episode length {len(py)} vs {len(fa)}"}
     for i, (a, b) in enumerate(zip(py, fa)):
@@ -160,13 +165,15 @@ def note(rows: list[dict], config: dict, elapsed_s: float) -> str:
         if not r:
             continue
         n_eq = sum(x["equal"] for x in r)
+        assert all(x["classes"] == ["Simulator", "FastSimulator"] for x in r)
         win = sum(x["windows"] for x in r)
         py = sum(x["wall_python_s"] for x in r)
         fa = sum(x["wall_fast_s"] for x in r)
         seeds = sorted(x["seed"] for x in r)
         lines += [f"## {name}", "",
                   f"- seeds {seeds[0]} to {seeds[-1]} ({len(r)} episodes, {win} windows)",
-                  f"- identical episodes: **{n_eq} / {len(r)}**",
+                  f"- identical episodes: **{n_eq} / {len(r)}** (Python `Simulator` vs `FastSimulator`, "
+                  "class checked per episode)",
                   f"- episode wall time (with R6): Python {py:.0f} s, fast {fa:.0f} s "
                   f"(x{py / max(fa, 1e-9):.1f})", ""]
         bad = sorted((x for x in r if not x["equal"]), key=lambda x: x["seed"])

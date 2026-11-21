@@ -6,7 +6,7 @@ and the window-end pass over the A queue (ages, overdue marking, work left) run 
 telemetry dict is built in Python from the kernel's results with the parent's expressions. The kernel
 receives the simulator's own `np.random.Generator` (numba draws the same streams from it and advances its
 state in place) and plain arrays. The A queue is kept as parallel arrays between windows (a deque view is
-available as `queue`), so even a queue of hundreds of thousands of requests costs no conversion.
+available as the read-only `queue`), so even a queue of hundreds of thousands of requests costs no conversion.
 
 Bitwise identity rests on doing every floating-point operation in the same order as the Python code:
   - numpy sums over a contiguous float64 array use pairwise summation (`_pairwise`), starting from 0.0;
@@ -452,16 +452,20 @@ class FastSimulator(Simulator):
     """`Simulator` with the per-step loop compiled; same telemetry, same generator state.
 
     The A queue lives in parallel arrays (arrival time, remaining ms, wake-up delay, counted late) between
-    windows, so a long queue costs no per-window conversion. `queue` reads as a fresh deque of
-    [arrival_t, remaining_ms, extra_delay_ms, counted_late] lists (a snapshot: changing it has no effect;
-    assign a new queue instead).
+    windows, so a long queue costs no per-window conversion. `queue` reads as an immutable snapshot (see
+    the property); assigning a new queue is supported.
     """
 
     @property
-    def queue(self) -> deque:
+    def queue(self) -> tuple:
+        """Read-only snapshot: a tuple of (arrival_t, remaining_ms, extra_delay_ms, counted_late) tuples.
+
+        Immutable on purpose, so in-place edits (append, clear, item assignment) fail loudly instead of being
+        lost; to change the queue, assign a new sequence of rows to `queue`.
+        """
         sl = slice(self._q_h, self._q_h + self._q_n)
-        return deque(map(list, zip(self._q_t[sl].tolist(), self._q_rem[sl].tolist(),
-                                   self._q_delay[sl].tolist(), self._q_late[sl].tolist())))
+        return tuple(zip(self._q_t[sl].tolist(), self._q_rem[sl].tolist(), self._q_delay[sl].tolist(),
+                         self._q_late[sl].tolist()))
 
     @queue.setter
     def queue(self, q) -> None:
