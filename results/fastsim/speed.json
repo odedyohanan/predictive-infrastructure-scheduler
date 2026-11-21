@@ -1,4 +1,47 @@
 {
+  "background": {
+    "commit": "492793e376d990d8acef2113a9bb6b26d1eab6ce",
+    "duration_s": null,
+    "machine": "Darwin arm64",
+    "priority": "background",
+    "priority_detail": "macOS background QoS",
+    "rows": [
+      {
+        "episode_fast_s": 3.0714253339683637,
+        "episode_python_s": 87.1593359579565,
+        "kind": "none",
+        "queue_len_max": 15,
+        "same_policies": true,
+        "seed": 3100,
+        "sim_fast_s": 0.4938842919655144,
+        "sim_python_s": 90.77470220800024,
+        "windows": 600
+      },
+      {
+        "episode_fast_s": 3.5898841669550166,
+        "episode_python_s": 99.52780750009697,
+        "kind": "gpu_loss",
+        "queue_len_max": 27,
+        "same_policies": true,
+        "seed": 3101,
+        "sim_fast_s": 1.27786270796787,
+        "sim_python_s": 94.4191204579547,
+        "windows": 600
+      },
+      {
+        "episode_fast_s": 3.449319332954474,
+        "episode_python_s": 95.62827970797662,
+        "kind": "none",
+        "queue_len_max": 290,
+        "same_policies": true,
+        "seed": 3102,
+        "sim_fast_s": 1.3717156250495464,
+        "sim_python_s": 93.3682124579791,
+        "windows": 600
+      }
+    ],
+    "warm_up_s": 0.7222403750056401
+  },
   "normal": {
     "commit": "d5d25093dc7fa99e13c330f74a8c6e84c803eeb3",
     "duration_s": null,
